@@ -85,20 +85,14 @@ for row, cat in enumerate(all_cats[:n_display]):
     ax.set_title(cat_label, fontsize=6)
     ax.axis('off')
     
-    # RGB 热力图（R/G/B 通道各自的活跃度）
+    # 活跃度（范数热力图）
     ax = axes[row, 1]
-    with torch.no_grad():
-        ch_norms = []
-        for c in range(3):
-            ch_img = torch.zeros_like(x)
-            ch_img[:, c:c+1] = x[:, c:c+1]
-            ch_field = pipe(ch_img)
-            ch_norms.append(ch_field[0].norm(dim=0))
-    rgb_act = torch.stack(ch_norms, dim=0)  # [3, H, W]
-    rgb_act = rgb_act / (rgb_act.max() + 1e-8)
-    rgb_heat = rgb_act.permute(1, 2, 0).cpu().numpy()
-    ax.imshow(rgb_heat)
-    ax.set_title("RGB活跃度", fontsize=6)
+    norms_np = norms.cpu().numpy()
+    # 百分比拉伸：取 2%~98% 分位数，避免极端值压暗全图
+    vmin = np.percentile(norms_np, 5)
+    vmax = np.percentile(norms_np, 98)
+    ax.imshow(norms_np, cmap='hot', vmin=vmin, vmax=vmax)
+    ax.set_title("活跃度", fontsize=8)
     ax.axis('off')
     
     # 掩码

@@ -67,8 +67,10 @@ for row, (img_name, img_path) in enumerate(img_paths):
     ax.axis('off')
 
     ax = axes[row, 1]
-    norm_display = (norms - norms.min()) / (norms.max() - norms.min() + 1e-8)
-    ax.imshow(norm_display.cpu().numpy(), cmap='hot')
+    norms_np = norms.cpu().numpy()
+    vmin = np.percentile(norms_np, 5)
+    vmax = np.percentile(norms_np, 98)
+    ax.imshow(norms_np, cmap='hot', vmin=vmin, vmax=vmax)
     ax.set_title("活跃度热力图（实时范数）", fontsize=9)
     ax.axis('off')
 
