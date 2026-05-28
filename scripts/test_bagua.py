@@ -91,7 +91,7 @@ def main():
     if args.viz:
         img_disp = cv2.resize(img_rgb, (224, 224))
         out_path = str(output_dir / f"bagua_activation_{Path(args.image).stem}.png")
-        visualize_all(img_tensor, img_disp, out_path)
+        visualize_all(img_tensor, img_disp, out_path, device=device)
         print(f"\n激活图已保存: {out_path}")
 
 

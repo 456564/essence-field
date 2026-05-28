@@ -54,20 +54,23 @@ def compute_activation_maps(net, img_tensor):
     return act
 
 
-def visualize_all(img_tensor, img_disp, output_path):
+def visualize_all(img_tensor, img_disp, output_path, device="cpu"):
     """绘制 8 卦的空间激活图"""
     fig, axes = plt.subplots(2, 4, figsize=(16, 8))
     axes = axes.ravel()
 
+    # 英文标签（避免 matplotlib 中文缺失）
+    EN_NAMES = ["Heaven\nQian", "Earth\nKun", "Thunder\nZhen", "Wind\nXun",
+                "Water\nKan", "Fire\nLi", "Mountain\nGen", "Lake\nDui"]
     for idx, (name, cn, desc, NetClass) in enumerate(BAGUA_REGISTRY):
-        net = NetClass().eval()
+        net = NetClass().to(device).eval()
         act = compute_activation_maps(net, img_tensor)
 
         ax = axes[idx]
         ax.imshow(img_disp, alpha=0.6)
         if act is not None:
             ax.imshow(act, cmap='hot', alpha=0.4, vmin=0, vmax=1)
-        ax.set_title(f"{cn}\n{desc}", fontsize=9)
+        ax.set_title(f"{EN_NAMES[idx]}", fontsize=9)
         ax.axis('off')
 
     plt.tight_layout()
