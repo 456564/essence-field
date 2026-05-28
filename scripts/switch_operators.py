@@ -13,14 +13,16 @@ from pathlib import Path
 
 SRC = Path("src")
 VERSIONS = {
-    "gray":     ("operators_gray.py",     "灰度版"),
-    "rgb":      ("operators_rgb.py",      "RGB版"),
-    "colormod": ("operators_colormod.py", "颜色调制版"),
+    "gray":       ("operators_gray.py",       "灰度版"),
+    "rgb":        ("operators_rgb.py",        "RGB版"),
+    "colormod":   ("operators_colormod.py",   "颜色调制版"),
+    "native":     ("operators_native.py",     "颜色原生版"),
+    "fixedcolor": ("operators_fixedcolor.py", "固定颜色版"),
 }
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: python scripts/switch_operators.py [gray|rgb|colormod|list]")
+        print("用法: python scripts/switch_operators.py [gray|rgb|colormod|native|fixedcolor|list]")
         sys.exit(1)
     
     cmd = sys.argv[1]

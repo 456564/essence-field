@@ -33,3 +33,4 @@ Thumbs.db
 *.tmp
 checkpoints/
 test_output/
+checkpoints*/

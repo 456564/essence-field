@@ -20,7 +20,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = BaguaPipeline(d=8).to(device).eval()
 
 # 加载训练后权重
-ckpt = torch.load("checkpoints_colormod/bootstrap_epoch20.pth", map_location=device)
+ckpt = torch.load("checkpoints_native/bootstrap_epoch20.pth", map_location=device)
 pipe.fusion.A.data = ckpt['A']
 pipe.operator_layer.projections.load_state_dict(ckpt['proj'])
 print("加载了训练后的权重")
