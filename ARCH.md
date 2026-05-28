@@ -13,11 +13,15 @@
 
 ## 算子版本演变
 
-| 版本 | 文件 | 颜色处理 | 训练后分离度 | 通用性通过率 |
-|:----|:----|:--------|:----------|:----------|
-| 灰度版 (gray) | `operators_gray.py` | x.mean(dim=1) 丢弃颜色 | ~10 | <50% 背景误标严重 |
-| RGB版 (rgb) | `operators_rgb.py` | 三通道分别跑算子取max | ~2.3 | 50-60% 但内部空洞更严重 |
-| **颜色调制版 (colormod)** | **`operators_colormod.py`** | **可学习1×1颜色卷积(3→1)** | **~3.1** | **58%, 80%空洞解决** |
+| 版本 | 文件 | 颜色处理 | 训练后分离度 | 通过率 | 物体完整度 |
+|:----|:----|:--------|:----------|:-----|:---------|
+| 灰度版 (gray) | `operators_gray.py` | x.mean(dim=1) 丢弃颜色 | ~10 | <50% | ❌ 大量空洞 |
+| RGB版 (rgb) | `operators_rgb.py` | 三通道分别跑算子取max | ~2.3 | ~58% | ❌ 空洞更多 |
+| 颜色调制版 (colormod) | `operators_colormod.py` | 可学习1×1颜色卷积(3→1) | ~3.1 | 58% | ⚠️ 80%空洞解决 |
+| 颜色原生版 (native) | `operators_native.py` | RGB全通道梯度，无选择性 | ~4.2 | 58% | ❌ 噪声叠加 |
+| **固定颜色+原始强度** (fixedcolor) | **`operators_fixedcolor.py`** | **固定颜色投影+原始强度+instancenorm** | **~15.6** | **100%** | **✅ 全部完整** |
+
+当前最佳：**固定颜色版 (fixedcolor)**
 
 切换命令：`python scripts/switch_operators.py [gray|rgb|colormod]`
 
@@ -107,7 +111,8 @@
 - ✅ 自举训练（InfoNCE对比学习）
 - ✅ 向量范数→物体定位
 - ✅ 向量方向→物质类型
-- ⏳ 跨图片通用性验证（通过率~58%，复杂物体仍有空洞）
+- ✅ 跨图片通用性验证（固定颜色版：通过率100%，平均分离度15.6）
+- ✅ 热力图百分比拉伸可视化
 - ❌ 跨图片物质类型匹配
 - ❌ 多物体场景
 - ❌ 基本单元压缩
@@ -119,9 +124,11 @@
 python scripts/switch_operators.py list
 
 # 切换版本
-python scripts/switch_operators.py gray     # 灰度版
-python scripts/switch_operators.py rgb      # RGB版（三通道取max）
-python scripts/switch_operators.py colormod # 颜色调制版（推荐）
+python scripts/switch_operators.py gray       # 灰度版
+python scripts/switch_operators.py rgb        # RGB版（三通道取max）
+python scripts/switch_operators.py colormod   # 颜色调制版
+python scripts/switch_operators.py native     # 颜色原生版
+python scripts/switch_operators.py fixedcolor # 固定颜色版（推荐）
 ```
 
 ## 文件结构
