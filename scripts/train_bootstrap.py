@@ -64,6 +64,11 @@ def train(args):
         color_params_count = sum(p.numel() for p in model.operator_layer.base_ops.parameters())
         print(f"  颜色卷积层: {color_params_count} 个参数")
 
+    # 学习率余弦退火
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs * min(args.max_batches or len(loader), len(loader)),
+        eta_min=args.lr_A * 0.01)
+
     model.train()
     for epoch in range(args.epochs):
         total_loss = 0.0
@@ -105,11 +110,35 @@ def train(args):
             logsumexp_all = torch.logsumexp(torch.cat([sim_pos, sim_neg], dim=1), dim=1)
             loss = - (logsumexp_pos - logsumexp_all).mean()
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # 4. 内部平滑损失：物体相邻像素范数差异最小化
+            if args.lambda_smooth > 0 and len(fg_idx) > 0:
+                norms_2d = norms.view(1, 1, H, W)  # [1,1,H,W]
+                mask_2d = fg_mask.view(1, 1, H, W).float()
+                # Sobel 差分 = |norm(i,j) - norm(i+1,j)| + |norm(i,j) - norm(i,j+1)|
+                sobel_h = torch.tensor([[[[0, 0, 0], [0, -1, 1], [0, 0, 0]]]],
+                                        dtype=field.dtype, device=device)
+                sobel_v = torch.tensor([[[[0, 0, 0], [0, -1, 0], [0, 1, 0]]]],
+                                        dtype=field.dtype, device=device)
+                diff_h = F.conv2d(norms_2d, sobel_h, padding=1) * mask_2d
+                diff_v = F.conv2d(norms_2d, sobel_v, padding=1) * mask_2d
+                smooth_loss = (diff_h.abs().sum() + diff_v.abs().sum()) / (mask_2d.sum() + 1e-6)
+            else:
+                smooth_loss = torch.tensor(0.0, device=device)
 
-            total_loss += loss.item()
+            # 5. 背景零化损失：背景范数趋近零
+            if args.lambda_bg > 0 and len(bg_idx) > 0:
+                bg_loss = norms[bg_idx].mean()
+            else:
+                bg_loss = torch.tensor(0.0, device=device)
+
+            total = loss + args.lambda_smooth * smooth_loss + args.lambda_bg * bg_loss
+
+            optimizer.zero_grad()
+            total.backward()
+            optimizer.step()
+            scheduler.step()
+
+            total_loss += total.item()
             n_valid += 1
 
             if (batch_idx + 1) % args.print_freq == 0:
@@ -145,7 +174,11 @@ if __name__ == '__main__':
     parser.add_argument('--save_dir', default='./checkpoints')
     parser.add_argument('--save_every', type=int, default=5)
     parser.add_argument('--print_freq', type=int, default=10)
-    parser.add_argument('--max_batches', type=int, default=500,
+    parser.add_argument('--max_batches', type=int, default=0,
                         help='每轮最多处理多少张（0=全部）')
+    parser.add_argument('--lambda_smooth', type=float, default=0.5,
+                        help='内部平滑损失权重')
+    parser.add_argument('--lambda_bg', type=float, default=0.1,
+                        help='背景零化损失权重')
     args = parser.parse_args()
     train(args)
