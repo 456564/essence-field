@@ -34,22 +34,35 @@ def train(args):
 
     model = BaguaPipeline().to(device)
 
-    # 冻结所有参数，仅解冻 A 核和 1×1 conv 投影层
+    # 冻结所有参数，仅解冻 A 核、投影层、颜色卷积层
     for param in model.parameters():
         param.requires_grad = False
     model.fusion.A.requires_grad = True
     for param in model.operator_layer.projections.parameters():
         param.requires_grad = True
+    
+    # 颜色调制版的 1×1 颜色卷积
+    if hasattr(model.operator_layer.base_ops, 'parameters'):
+        for param in model.operator_layer.base_ops.parameters():
+            param.requires_grad = True
 
     optimizer = torch.optim.Adam([
         {'params': [model.fusion.A], 'lr': args.lr_A},
         {'params': model.operator_layer.projections.parameters(), 'lr': args.lr_proj},
     ])
+    # 如果存在颜色卷积，加进去（用稍高的学习率）
+    if hasattr(model.operator_layer.base_ops, 'parameters'):
+        color_params = list(model.operator_layer.base_ops.parameters())
+        if color_params:
+            optimizer.add_param_group({'params': color_params, 'lr': args.lr_A * 3})
 
     print(f"可训练参数:")
     print(f"  A 核: {model.fusion.A.numel()} 个参数")
     proj_params = sum(p.numel() for p in model.operator_layer.projections.parameters())
     print(f"  投影层: {proj_params} 个参数")
+    if hasattr(model.operator_layer.base_ops, 'parameters'):
+        color_params_count = sum(p.numel() for p in model.operator_layer.base_ops.parameters())
+        print(f"  颜色卷积层: {color_params_count} 个参数")
 
     model.train()
     for epoch in range(args.epochs):

@@ -20,7 +20,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = BaguaPipeline(d=8).to(device).eval()
 
 # 加载训练后权重
-ckpt = torch.load("checkpoints/bootstrap_epoch20.pth", map_location=device)
+ckpt = torch.load("checkpoints_colormod/bootstrap_epoch20.pth", map_location=device)
 pipe.fusion.A.data = ckpt['A']
 pipe.operator_layer.projections.load_state_dict(ckpt['proj'])
 print("加载了训练后的权重")
@@ -36,9 +36,9 @@ results = []
 n_total = 0
 n_pass = 0
 
-# 可视化：每类一行（原图 + 热力图 + 物体掩码）
-n_display = 50
-fig, axes = plt.subplots(n_display, 3, figsize=(14, n_display * 2))
+# 可视化：每类一行，展示 12 张图，每张 4 列
+n_display = 12
+fig, axes = plt.subplots(n_display, 4, figsize=(18, n_display * 3))
 
 for row, cat in enumerate(all_cats[:n_display]):
     files = sorted((DATA / cat).glob("*.*"))
@@ -85,11 +85,20 @@ for row, cat in enumerate(all_cats[:n_display]):
     ax.set_title(cat_label, fontsize=6)
     ax.axis('off')
     
-    # 热力图
+    # RGB 热力图（R/G/B 通道各自的活跃度）
     ax = axes[row, 1]
-    norm_display = (norms - norms.min()) / (norms.max() - norms.min() + 1e-8)
-    ax.imshow(norm_display.cpu().numpy(), cmap='hot')
-    ax.set_title(f"活跃度", fontsize=6)
+    with torch.no_grad():
+        ch_norms = []
+        for c in range(3):
+            ch_img = torch.zeros_like(x)
+            ch_img[:, c:c+1] = x[:, c:c+1]
+            ch_field = pipe(ch_img)
+            ch_norms.append(ch_field[0].norm(dim=0))
+    rgb_act = torch.stack(ch_norms, dim=0)  # [3, H, W]
+    rgb_act = rgb_act / (rgb_act.max() + 1e-8)
+    rgb_heat = rgb_act.permute(1, 2, 0).cpu().numpy()
+    ax.imshow(rgb_heat)
+    ax.set_title("RGB活跃度", fontsize=6)
     ax.axis('off')
     
     # 掩码
@@ -97,13 +106,25 @@ for row, cat in enumerate(all_cats[:n_display]):
     mask_vis = obj_mask.float().cpu().numpy()
     ax.imshow(mask_vis, cmap='gray')
     color = 'green' if sep_ratio > 2.0 else 'red'
-    ax.set_title(f"物{obj_pct:.0f}% 分{sep_ratio:.1f}",
-                 fontsize=6, color=color)
+    ax.set_title(f"物体掩码 占比{obj_pct:.0f}% 分离度{sep_ratio:.1f}",
+                 fontsize=8, color=color)
+    ax.axis('off')
+    
+    # 叠加
+    ax = axes[row, 3]
+    alpha = 0.5
+    overlay = (1-alpha) * img_small / 255.0
+    mask_color = np.zeros((SIZE, SIZE, 3))
+    mask_color[obj_mask.cpu().numpy()] = [0, 0.8, 0.2]
+    overlay += alpha * mask_color
+    overlay = np.clip(overlay, 0, 1)
+    ax.imshow(overlay)
+    ax.set_title("掩码叠加原图", fontsize=8)
     ax.axis('off')
 
 # 隐藏剩余行
 for row in range(len(results), n_display):
-    for col in range(3):
+    for col in range(4):
         axes[row, col].axis('off')
 
 out = "test_output/generalization_trained2.png"

@@ -12,7 +12,15 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from .operators import BaguaOperatorLayer, BAGUA_OPERATORS
+from .operators import BAGUA_OPERATORS
+
+# 算子层选择：colormod 版用 nn.Module 实现
+try:
+    from .operators import ColorModulatedOperatorLayer as _BaseOps
+    _HAS_COLORMOD = True
+except ImportError:
+    from .operators import BaguaOperatorLayer as _BaseOps
+    _HAS_COLORMOD = False
 
 
 class BilinearFusion(nn.Module):
@@ -41,7 +49,7 @@ class MultiDimOperatorLayer(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.base_ops = BaguaOperatorLayer()
+        self.base_ops = _BaseOps()
         self.projections = nn.ModuleDict({
             name: nn.Conv2d(1, 8, 1) for name in BAGUA_OPERATORS
         })
