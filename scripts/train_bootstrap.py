@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms, datasets
+from tqdm import tqdm
 
 from src.pipeline import BaguaPipeline
 
@@ -64,6 +65,11 @@ def train(args):
         color_params_count = sum(p.numel() for p in model.operator_layer.base_ops.parameters())
         print(f"  颜色卷积层: {color_params_count} 个参数")
 
+    # 早停
+    best_loss = float('inf')
+    patience_counter = 0
+    patience = args.patience
+
     # 学习率余弦退火
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs * min(args.max_batches or len(loader), len(loader)),
@@ -74,7 +80,9 @@ def train(args):
         total_loss = 0.0
         n_valid = 0
 
-        for batch_idx, (img, _) in enumerate(loader):
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}",
+                    total=args.max_batches or len(loader), leave=False)
+        for batch_idx, (img, _) in enumerate(pbar):
             if args.max_batches and batch_idx >= args.max_batches:
                 break
             img = img.to(device)                 # [1, 3, H, W]
@@ -110,43 +118,28 @@ def train(args):
             logsumexp_all = torch.logsumexp(torch.cat([sim_pos, sim_neg], dim=1), dim=1)
             loss = - (logsumexp_pos - logsumexp_all).mean()
 
-            # 4. 内部平滑损失：物体相邻像素范数差异最小化
-            if args.lambda_smooth > 0 and len(fg_idx) > 0:
-                norms_2d = norms.view(1, 1, H, W)  # [1,1,H,W]
-                mask_2d = fg_mask.view(1, 1, H, W).float()
-                # Sobel 差分 = |norm(i,j) - norm(i+1,j)| + |norm(i,j) - norm(i,j+1)|
-                sobel_h = torch.tensor([[[[0, 0, 0], [0, -1, 1], [0, 0, 0]]]],
-                                        dtype=field.dtype, device=device)
-                sobel_v = torch.tensor([[[[0, 0, 0], [0, -1, 0], [0, 1, 0]]]],
-                                        dtype=field.dtype, device=device)
-                diff_h = F.conv2d(norms_2d, sobel_h, padding=1) * mask_2d
-                diff_v = F.conv2d(norms_2d, sobel_v, padding=1) * mask_2d
-                smooth_loss = (diff_h.abs().sum() + diff_v.abs().sum()) / (mask_2d.sum() + 1e-6)
-            else:
-                smooth_loss = torch.tensor(0.0, device=device)
-
-            # 5. 背景零化损失：背景范数趋近零
-            if args.lambda_bg > 0 and len(bg_idx) > 0:
-                bg_loss = norms[bg_idx].mean()
-            else:
-                bg_loss = torch.tensor(0.0, device=device)
-
-            total = loss + args.lambda_smooth * smooth_loss + args.lambda_bg * bg_loss
-
             optimizer.zero_grad()
-            total.backward()
+            loss.backward()
             optimizer.step()
             scheduler.step()
 
-            total_loss += total.item()
+            total_loss += loss.item()
             n_valid += 1
+            pbar.set_postfix(loss=f"{total_loss/n_valid:.6f}")
 
-            if (batch_idx + 1) % args.print_freq == 0:
-                print(f"  Epoch {epoch+1}/{args.epochs} | Batch {batch_idx+1} | "
-                      f"Loss {total_loss/n_valid:.6f}")
-
+        pbar.close()
         avg_loss = total_loss / max(n_valid, 1)
-        print(f"=== Epoch {epoch+1}/{args.epochs} avg loss {avg_loss:.6f} ===")
+        tqdm.write(f"=== Epoch {epoch+1}/{args.epochs} avg loss {avg_loss:.6f} ===")
+
+        # 早停
+        if avg_loss < best_loss - args.min_delta:
+            best_loss = avg_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                tqdm.write(f"早停: {patience}轮未改善，停止训练")
+                break
 
         if (epoch + 1) % args.save_every == 0:
             os.makedirs(args.save_dir, exist_ok=True)
@@ -176,9 +169,9 @@ if __name__ == '__main__':
     parser.add_argument('--print_freq', type=int, default=10)
     parser.add_argument('--max_batches', type=int, default=0,
                         help='每轮最多处理多少张（0=全部）')
-    parser.add_argument('--lambda_smooth', type=float, default=0.5,
-                        help='内部平滑损失权重')
-    parser.add_argument('--lambda_bg', type=float, default=0.1,
-                        help='背景零化损失权重')
+    parser.add_argument('--patience', type=int, default=5,
+                        help='早停：连续几轮无改善则停止')
+    parser.add_argument('--min_delta', type=float, default=0.001,
+                        help='早停：最小改善阈值')
     args = parser.parse_args()
     train(args)
