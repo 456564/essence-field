@@ -13,6 +13,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+def _normalize(v):
+    """归一化 RGB 方向向量"""
+    n = np.sqrt(sum(x*x for x in v))
+    return [x/n for x in v] if n > 0 else v
+
 
 # ═══════════════════════════════════════════════════════════
 # 固 定 颜 色 权 重（八卦传统颜色映射）
@@ -21,14 +26,14 @@ import numpy as np
 # 每个算子天生只知道"自己该看什么颜色"。
 # 权重 = [R, G, B] 系数，正=敏感，负=抑制，0=忽略
 FIXED_BAGUA_COLORS = {
-    'qian': [1.0, 0.5, 0.0],   # 乾→天→赤/玄黄→红黄
-    'kun':  [0.0, 0.5, 0.0],   # 坤→地→黄/黑→绿
-    'zhen': [0.0, 1.0, 0.5],   # 震→雷→青绿→绿蓝
-    'xun':  [1.0, 1.0, 1.0],   # 巽→风→白→全色（无偏）
-    'kan':  [0.0, 0.2, 1.0],   # 坎→水→黑/深蓝→蓝
-    'li':   [1.0, 0.0, 0.0],   # 离→火→赤→红
-    'gen':  [0.8, 0.6, 0.2],   # 艮→山→黄/棕→橙黄
-    'dui':  [0.5, 0.5, 0.8],   # 兑→泽→白/蓝→泛蓝白
+    'qian': _normalize([1.0, 0.6, 0.0]),   # 乾→天→赤/玄黄→橙红
+    'kun':  _normalize([0.2, 0.5, 0.1]),   # 坤→地→黄/黑→暗绿
+    'zhen': _normalize([0.2, 1.0, 0.6]),   # 震→雷→青绿→绿蓝
+    'xun':  _normalize([0.9, 0.9, 0.9]),   # 巽→风→白→全色偏亮
+    'kan':  _normalize([0.1, 0.3, 1.0]),   # 坎→水→黑/深蓝→蓝
+    'li':   _normalize([1.0, 0.1, 0.1]),   # 离→火→赤→红偏亮
+    'gen':  _normalize([0.9, 0.7, 0.2]),   # 艮→山→黄/棕→橙黄
+    'dui':  _normalize([0.6, 0.6, 0.9]),   # 兑→泽→白/蓝→泛蓝白
 }
 
 
@@ -42,13 +47,14 @@ def _box_filter(x, k=5):
 
 
 def _qian(ch):
+    """乾 — 圆环颜色一致性强度（1/方差），无压缩"""
     B, C, H, W = ch.shape
     device = ch.device
     sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
                          dtype=ch.dtype, device=ch.device)
     gx = F.conv2d(ch, sobel, padding=1)
     gy = F.conv2d(ch, sobel.transpose(2,3), padding=1)
-    mask = torch.sigmoid((torch.sqrt(gx**2 + gy**2 + 1e-6) - 0.03) * 200)
+    energy = torch.sqrt(gx**2 + gy**2 + 1e-6)
     out = []
     for r in [2, 4, 6]:
         ang = torch.linspace(0, 2*np.pi, 12, device=device)
@@ -62,25 +68,28 @@ def _qian(ch):
             s = s[:, :, pd:pd+H, pd:pd+W]
             smp.append(s)
         smp = torch.stack(smp, dim=1)
-        out.append(torch.exp(-smp.var(dim=1, unbiased=False) * 10))
-    return torch.stack(out, dim=0).mean(dim=0) * mask
+        var_map = smp.var(dim=1, unbiased=False) + 1e-6
+        out.append(1.0 / var_map)  # 方差小=一致性强=输出大
+    return torch.stack(out, dim=0).mean(dim=0) * energy
 
 
 def _kun(ch):
+    """坤 — 平坦度（1/局部方差），无压缩"""
     m = _box_filter(ch, k=9)
-    v = _box_filter((ch - m)**2, k=9)
-    gv = ch.var(dim=[2,3], keepdim=True) + 1e-6
-    return torch.exp(-v / gv)
+    v = _box_filter((ch - m)**2, k=9) + 1e-6
+    return 1.0 / v  # 平坦=局部方差小=输出大
 
 
 def _zhen(ch):
+    """震 — 颜色拉普拉斯幅值，无压缩"""
     k = torch.tensor([[[[0, -1, 0], [-1, 4, -1], [0, -1, 0]]]],
                      dtype=ch.dtype, device=ch.device)
     lap = F.conv2d(ch, k, padding=1)
-    return torch.tanh(torch.abs(lap) * 5)
+    return torch.abs(lap) * 5.0
 
 
 def _xun(ch):
+    """巽 — 方向一致性强度（1/方向梯度方差），无压缩"""
     device = ch.device
     kd = [
         [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
@@ -92,15 +101,16 @@ def _xun(ch):
     sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
                          dtype=ch.dtype, device=ch.device)
     gs = torch.stack([F.conv2d(ch, k, padding=1) for k in k4], dim=1)
-    gv = ((gs - gs.mean(dim=1, keepdim=True))**2).mean(dim=1)
-    tn = torch.exp(-gv * 5)
+    gv = ((gs - gs.mean(dim=1, keepdim=True))**2).mean(dim=1) + 1e-6
+    consistency = 1.0 / gv  # 梯度方差小=单一方向占优=输出大
     gx = F.conv2d(ch, sobel, padding=1)
     gy = F.conv2d(ch, sobel.transpose(2,3), padding=1)
-    en = torch.sigmoid((torch.sqrt(gx**2 + gy**2 + 1e-6) - 0.03) * 200)
-    return tn * en
+    energy = torch.sqrt(gx**2 + gy**2 + 1e-6)
+    return consistency * energy
 
 
 def _kan(ch):
+    """坎 — 颜色梯度场曲率幅值，无压缩"""
     sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
                          dtype=ch.dtype, device=ch.device)
     gx = F.conv2d(ch, sobel, padding=1)
@@ -110,18 +120,20 @@ def _kan(ch):
     ny = gy / (gm + 1e-6)
     nxx = F.conv2d(nx, sobel, padding=1)
     nyy = F.conv2d(ny, sobel.transpose(2,3), padding=1)
-    return torch.tanh(torch.abs(nxx + nyy) * 10)
+    return torch.abs(nxx + nyy) * 10.0
 
 
 def _li(ch):
+    """离 — 梯度强度，无压缩"""
     sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
                          dtype=ch.dtype, device=ch.device)
     gx = F.conv2d(ch, sobel, padding=1)
     gy = F.conv2d(ch, sobel.transpose(2,3), padding=1)
-    return torch.tanh(torch.sqrt(gx**2 + gy**2 + 1e-6) * 5)
+    return torch.sqrt(gx**2 + gy**2 + 1e-6) * 5.0
 
 
 def _gen(ch):
+    """艮 — 局部块状纹理强度，无压缩"""
     device = ch.device
     sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
                          dtype=ch.dtype, device=ch.device)
@@ -130,27 +142,28 @@ def _gen(ch):
     pad = F.pad(ch, [pd]*4, mode='reflect')
     pat = F.unfold(pad, kernel_size=ps, stride=1)
     pv = pat.var(dim=1, unbiased=False).view(-1, 1, Hc, Wc)
-    bl = torch.tanh(pv * 20)
+    bl = pv * 20.0
     gx = F.conv2d(pv, sobel, padding=1)
     gy = F.conv2d(pv, sobel.transpose(2,3), padding=1)
-    bd = torch.tanh(torch.sqrt(gx**2 + gy**2 + 1e-6) * 10)
+    bd = torch.sqrt(gx**2 + gy**2 + 1e-6) * 10.0
     return torch.max(bl * 0.5, bd * 0.8)
 
 
 def _dui(ch):
+    """兑 — 中心-环绕颜色对比度，无压缩"""
     device = ch.device
     sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
                          dtype=ch.dtype, device=ch.device)
     gx = F.conv2d(ch, sobel, padding=1)
     gy = F.conv2d(ch, sobel.transpose(2,3), padding=1)
-    em = torch.sigmoid((torch.sqrt(gx**2 + gy**2 + 1e-6) - 0.03) * 200)
+    energy = torch.sqrt(gx**2 + gy**2 + 1e-6)
     ctr = _box_filter(ch, k=5)
     sr = _box_filter(ch, k=15)
     ct = sr - ctr
-    cv = torch.sigmoid((ct - 0.02) * 40) * em
+    cv = ct * energy  # 对比度 × 边缘能量
     gx2 = F.conv2d(ct, sobel, padding=1)
     gy2 = F.conv2d(ct, sobel.transpose(2,3), padding=1)
-    asy = torch.tanh(torch.sqrt(gx2**2 + gy2**2 + 1e-6) * 10) * em
+    asy = torch.sqrt(gx2**2 + gy2**2 + 1e-6) * 10.0 * energy
     return torch.max(cv, asy)
 
 
@@ -188,8 +201,9 @@ class ColorFixedOperator(nn.Module):
             torch.tensor(color_weights, dtype=torch.float32).view(1, 3, 1, 1))
 
     def forward(self, x):
-        # 固定颜色混合（无参数，不训练）
-        x_mod = (x * self.weight).sum(dim=1, keepdim=True)
+        # 像素在卦象颜色方向上的投影 = 该象的程度值
+        # clamp 保证程度值在 [0,1]，负数表示"完全不象"
+        x_mod = (x * self.weight).sum(dim=1, keepdim=True).clamp(min=0)
         return self.base_fn(x_mod)
 
 

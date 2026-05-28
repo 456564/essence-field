@@ -11,6 +11,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from .operators import BAGUA_OPERATORS
 
@@ -58,7 +59,11 @@ class MultiDimOperatorLayer(nn.Module):
         base_maps = self.base_ops(x)
         multi_maps = []
         for name in BAGUA_OPERATORS:
-            feat = self.projections[name](base_maps[name])
+            out = base_maps[name]
+            # 算子输出的强度图范围差异大（1/方差可达上万），
+            # 用无参数实例归一化稳定尺度，不改变相对强度关系。
+            out = F.instance_norm(out)
+            feat = self.projections[name](out)
             multi_maps.append(feat)
         return torch.stack(multi_maps, dim=1)
 
