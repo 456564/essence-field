@@ -96,30 +96,46 @@
 1. 64维场 → 范数中位数 → 物体/背景掩码
 2. InfoNCE损失：物体内像素方向对齐，物体与背景方向分离
 
-可训练参数（总计 640+ 个）：
+可训练参数（固定颜色版）：
 - A核：64 参数（双线性融合）
-- 投影层：8×8+8 = 72 参数（1×1 conv）
-- 颜色卷积层：8×(3+1) = 32 参数（颜色调制版特有）
+- 投影层：8×(1×1 conv) = 72 参数
+- 颜色卷积层：0 参数（颜色权重固定为 register_buffer）
+- 总计：~136 参数
 
-训练后效果：颜色调制版分离度~3.1，背景干净，物体内部空洞80%解决。
+训练后效果：
+- 固定颜色版分离度~15，100%通过率
+- 线性分类 44.7%，显著性MAE 0.15
+- 杯内掩码填充38%（坤容器升级中）
 
 ## 当前状态
 
-- ✅ 8算子输出（固定数学运算）
+- ✅ 5个算子版本 (gray/rgb/colormod/native/fixedcolor)
 - ✅ 固定颜色版算子（八卦颜色投影 + 原始强度 + instance norm）
 - ✅ 双线性融合生成64维场
-- ✅ 自举训练（InfoNCE对比学习）
-- ✅ 向量范数→物体定位
-- ✅ 向量方向→物质类型
-- ✅ 跨图片通用性验证（固定颜色版：通过率100%，平均分离度15.6）
-- ✅ 线性分类探测（Caltech101 44.7%，远超随机~1%）
-- ✅ 显著性检测（DUTS-TE MAE=0.15，优于IT/AIM）
-- ✅ 热力图百分比拉伸可视化
+- ✅ 自举训练（InfoNCE + 早停 + 余弦退火 + tqdm）
+- ✅ 向量范数→物体定位（分离度~15, 100%通过率）
+- ✅ 线性分类探测（Caltech101 44.7%，随机基线~1%）
+- ✅ 显著性检测（DUTS-TE MAE=0.15）
+- ✅ 声纳可视化面板（`src/visualize.py`）
+- ✅ 训练复合图自动保存（每5轮 epochXX_composite.png）
+- ⚠️ 坤升级为容器检测器（迭代中 — 杯内响应0.924 ✅, 但投影后颠倒 ❌）
 - ❌ 跨图片物质类型匹配
 - ❌ 多物体场景
 - ❌ 基本单元压缩
-- ❌ 算子的颜色响应雷达图
-- ❌ A核谱分解
+- ❌ A核谱分解 + 算子颜色雷达图
+
+### 坤容器检测升级（进行中）
+
+核心改动：`_kun` 不再测平坦度(1/方差)，改为"被边缘围合的内部"：
+- Sobel边缘 → 软边界 → 51×51大核镜像扩散 → ×颜色一致性
+- 原始输出正确（杯内0.924 > 背景0.760）
+- 但训练投影层将其学反（杯内0.356 < 背景3.026）
+- 最后尝试：放大输出×10 → `checkpoints_fixedcolor/bootstrap_epoch15.pth`
+
+调试工具：
+- `python scripts/test_kun_diag.py` — 对比坤原始输出 vs 投影后
+- `python scripts/test_kun_maccup.py` — 杯子图坤响应 + 叠加
+- `python scripts/test_single_trained.py` — 含argmax复合图
 
 ## 版本切换
 
@@ -139,14 +155,23 @@ python scripts/switch_operators.py fixedcolor # 固定颜色版（推荐）
 
 ```
 src/
-  operators.py            ← 当前使用的算子版本
-  operators_gray.py       [VERSION=gray]     灰度版
-  operators_rgb.py        [VERSION=rgb]      RGB版
-  operators_colormod.py   [VERSION=colormod] 颜色调制版（最佳）
-  pipeline.py             ← 流水线：算子→双线性融合→64维场
-checkpoints/              ← 灰度版训练权重
-checkpoints_rgb/          ← RGB版训练权重
-checkpoints_colormod/     ← 颜色调制版训练权重
+  operators.py              ← 当前算子（固定颜色版副本）
+  operators_fixedcolor.py   [VERSION=fixedcolor] 当前最优
+  operators_gray.py         [VERSION=gray]
+  operators_rgb.py          [VERSION=rgb]
+  operators_colormod.py     [VERSION=colormod]
+  operators_native.py       [VERSION=native]
+  pipeline.py               ← 流水线：算子→投影→融合→64维场
+  visualize.py              ← 声纳面板+argmax复合+blended混合
+checkpoints_fixedcolor/     ← 当前训练权重
+  bootstrap_epoch15.pth     ← 最新（Kun ×10, 15轮）
 scripts/
-  train_bootstrap.py      ← 自举训练
-  switch_operators.py     ← 版本切换工具
+  train_bootstrap.py        ← 自举训练(tqdm+早停+余弦退火)
+  switch_operators.py       ← 5版本切换
+  test_single_trained.py    ← 6图单张测试(含argmax复合)
+  test_generalization_trained.py ← 通用性测试
+  test_kun_diag.py          ← 坤诊断(原始vs投影后)
+  test_kun_maccup.py        ← 杯子图坤响应
+  test_sonar.py             ← 声纳面板
+  saliency_test.py          ← DUTS-TE显著性
+  linear_probe.py           ← 线性分类探测
