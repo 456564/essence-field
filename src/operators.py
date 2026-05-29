@@ -31,7 +31,7 @@ FIXED_BAGUA_COLORS = {
     'zhen': _normalize([0.2, 1.0, 0.6]),   # 震→雷→青绿→绿蓝
     'xun':  _normalize([0.9, 0.9, 0.9]),   # 巽→风→白→全色偏亮
     'kan':  _normalize([0.1, 0.3, 1.0]),   # 坎→水→黑/深蓝→蓝
-    'li':   _normalize([1.0, 0.1, 0.1]),   # 离→火→赤→红偏亮
+    'li':   [1.0, -0.5, -0.5],            # 离→火→赤→红胜绿蓝
     'gen':  _normalize([0.9, 0.7, 0.2]),   # 艮→山→黄/棕→橙黄
     'dui':  _normalize([0.6, 0.6, 0.9]),   # 兑→泽→白/蓝→泛蓝白
 }
@@ -47,16 +47,11 @@ def _box_filter(x, k=5):
 
 
 def _qian(ch):
-    """乾 — 圆环颜色一致性强度（1/方差），无压缩"""
+    """乾 — 天/圆/完整。环采样一致性=圆度，取各半径最佳。"""
     B, C, H, W = ch.shape
     device = ch.device
-    sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
-                         dtype=ch.dtype, device=ch.device)
-    gx = F.conv2d(ch, sobel, padding=1)
-    gy = F.conv2d(ch, sobel.transpose(2,3), padding=1)
-    energy = torch.sqrt(gx**2 + gy**2 + 1e-6)
     out = []
-    for r in [2, 4, 6]:
+    for r in [8, 16, 32]:
         ang = torch.linspace(0, 2*np.pi, 12, device=device)
         oy = (r * torch.sin(ang)).round().long()
         ox = (r * torch.cos(ang)).round().long()
@@ -68,49 +63,19 @@ def _qian(ch):
             s = s[:, :, pd:pd+H, pd:pd+W]
             smp.append(s)
         smp = torch.stack(smp, dim=1)
-        var_map = smp.var(dim=1, unbiased=False) + 0.01  # 上界≈100，防1/方差爆炸
+        var_map = smp.var(dim=1, unbiased=False) + 0.01
         out.append(1.0 / var_map)
-    return torch.stack(out, dim=0).mean(dim=0) * energy
+    return torch.stack(out, dim=0).max(dim=0)[0]
 
 
 def _kun(ch):
-    """
-    坤 — 容器检测（"被边界围合的内部区域"）
-
-    修正版：
-      1. Sobel边缘 → 软边界（边缘≈0，非边缘≈1）
-      2. 大核模糊（51×51）模拟"距边缘深度"
-      3. 颜色一致性（平坦度）
-      4. 中心偏置（图边≈背景）
-    """
-    B, C, H, W = ch.shape
-    device = ch.device
-
-    # 1. 边缘检测
-    sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
-                         dtype=ch.dtype, device=device)
-    gx = F.conv2d(ch, sobel, padding=1)
-    gy = F.conv2d(ch, sobel.transpose(2, 3), padding=1)
-    edge = torch.sqrt(gx**2 + gy**2 + 1e-6)
-
-    # 2. 软边界：边缘→0，内部→1
-    interior = 1.0 - torch.tanh(edge * 2.0)
-
-    # 3. 大核模糊 = 距离扩散（镜像填充避免边界伪影）
-    ksize = min(51, min(H, W) - 2)
-    if ksize % 2 == 0:
-        ksize -= 1
-    pad = ksize // 2
-    interior_padded = F.pad(interior, [pad, pad, pad, pad], mode='reflect')
-    box = torch.ones(1, 1, ksize, ksize, device=device, dtype=ch.dtype) / (ksize * ksize)
-    depth = F.conv2d(interior_padded, box)
-
-    # 4. 颜色一致性
-    local_mean = _box_filter(ch, k=9)
-    local_var = _box_filter((ch - local_mean)**2, k=9) + 1e-6
-    consistency = 1.0 / (local_var * 50.0 + 1.0)
-
-    return depth * consistency * 10.0  # 平坦=局部方差小=输出大
+    """坤 — 地/结构平坦。Laplacian密度低=无边缘/纹理=平坦，不管颜色怎么变。"""
+    lap_k = torch.tensor([[[[0, -1, 0], [-1, 4, -1], [0, -1, 0]]]],
+                         dtype=ch.dtype, device=ch.device)
+    lap = F.conv2d(ch, lap_k, padding=1).abs()  # [B,1,H,W]
+    k = 31
+    lap_density = _box_filter(lap, k=k)  # 局部平均边缘强度
+    return 1.0 / (lap_density * 5.0 + 1.0)  # 边缘多→坤低, 无边缘→坤高
 
 
 def _zhen(ch):
@@ -122,82 +87,64 @@ def _zhen(ch):
 
 
 def _xun(ch):
-    """巽 — 方向一致性强度（1/方向梯度方差），无压缩"""
+    """巽 — 方向/穿透度。最强方向超出其他方向的程度。"""
     device = ch.device
-    kd = [
-        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-        [[-2, -1, 0], [-1, 0, 1], [0, 1, 2]],
-        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-        [[0, 1, 2], [-1, 0, 1], [-2, -1, 0]],
-    ]
-    k4 = [torch.tensor([[k]], dtype=ch.dtype, device=ch.device) for k in kd]
-    sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
-                         dtype=ch.dtype, device=ch.device)
-    gs = torch.stack([F.conv2d(ch, k, padding=1) for k in k4], dim=1)
-    gv = ((gs - gs.mean(dim=1, keepdim=True))**2).mean(dim=1) + 1e-6
-    consistency = 1.0 / gv  # 梯度方差小=单一方向占优=输出大
-    gx = F.conv2d(ch, sobel, padding=1)
-    gy = F.conv2d(ch, sobel.transpose(2,3), padding=1)
-    energy = torch.sqrt(gx**2 + gy**2 + 1e-6)
-    return consistency * energy
+
+    k0 = torch.tensor([[[[-1,0,1],[-2,0,2],[-1,0,1]]]], dtype=ch.dtype, device=device)
+    g0 = F.conv2d(ch, k0, padding=1)     # 0°
+    g90 = F.conv2d(ch, k0.transpose(2,3), padding=1)  # 90°
+    k45 = torch.tensor([[[[-2,-1,0],[-1,0,1],[0,1,2]]]], dtype=ch.dtype, device=device)
+    g45 = F.conv2d(ch, k45, padding=1)
+    k135 = torch.tensor([[[[0,1,2],[-1,0,1],[-2,-1,0]]]], dtype=ch.dtype, device=device)
+    g135 = F.conv2d(ch, k135, padding=1)
+
+    g = torch.stack([g0.abs().squeeze(1), g45.abs().squeeze(1),
+                     g90.abs().squeeze(1), g135.abs().squeeze(1)], dim=1)  # [B,4,H,W]
+    mx, _ = g.max(dim=1, keepdim=True)  # [B,1,H,W]
+    # 减去其他三个方向的均值 = 纯方向性
+    directionality = (mx - (g.sum(dim=1, keepdim=True) - mx) / 3.0).clamp(min=0)
+    return directionality * 3.0
 
 
 def _kan(ch):
-    """坎 — 颜色梯度场曲率幅值，无压缩"""
-    sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
-                         dtype=ch.dtype, device=ch.device)
-    gx = F.conv2d(ch, sobel, padding=1)
-    gy = F.conv2d(ch, sobel.transpose(2,3), padding=1)
-    gm = torch.sqrt(gx**2 + gy**2 + 1e-6)
-    nx = gx / (gm + 1e-6)
-    ny = gy / (gm + 1e-6)
-    nxx = F.conv2d(nx, sobel, padding=1)
-    nyy = F.conv2d(ny, sobel.transpose(2,3), padding=1)
-    return torch.abs(nxx + nyy) * 10.0
+    """坎 — 水/陷。多尺度低洼：中心比周围暗=凹陷。"""
+    darkness = (1.0 - ch).clamp(min=0)
+    _, _, H, W = ch.shape
+    depression = torch.zeros_like(ch)
+    for k in [7, 15, 31]:
+        c = _box_filter(ch, k=k)
+        s = _box_filter(ch, k=k*2+1)  # 奇数防尺寸漂移
+        depression = depression + (s - c).clamp(min=0)
+    return depression * darkness * 5.0
 
 
 def _li(ch):
-    """离 — 梯度强度，无压缩"""
-    sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
-                         dtype=ch.dtype, device=ch.device)
-    gx = F.conv2d(ch, sobel, padding=1)
-    gy = F.conv2d(ch, sobel.transpose(2,3), padding=1)
-    return torch.sqrt(gx**2 + gy**2 + 1e-6) * 5.0
+    """离 — 光明/炽热度。颜色投影已挑出暖色，亮度即离强度。"""
+    return ch
 
 
 def _gen(ch):
-    """艮 — 局部块状纹理强度，无压缩"""
-    device = ch.device
+    """艮 — 山/阻隔/块度。大范围纹理特性突变的边界。"""
+    lm = _box_filter(ch, k=15)
+    texture = _box_filter((ch - lm)**2, k=15)
+    # 平滑纹理图 → 只有大型纹理区域切换才被检测
+    texture = _box_filter(texture, k=15)
+
     sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
                          dtype=ch.dtype, device=ch.device)
-    _, _, Hc, Wc = ch.shape
-    ps, pd = 15, 7
-    pad = F.pad(ch, [pd]*4, mode='reflect')
-    pat = F.unfold(pad, kernel_size=ps, stride=1)
-    pv = pat.var(dim=1, unbiased=False).view(-1, 1, Hc, Wc)
-    bl = pv * 20.0
-    gx = F.conv2d(pv, sobel, padding=1)
-    gy = F.conv2d(pv, sobel.transpose(2,3), padding=1)
-    bd = torch.sqrt(gx**2 + gy**2 + 1e-6) * 10.0
-    return torch.max(bl * 0.5, bd * 0.8)
+    gx = F.conv2d(texture, sobel, padding=1)
+    gy = F.conv2d(texture, sobel.transpose(2, 3), padding=1)
+    return torch.sqrt(gx**2 + gy**2 + 1e-6) * 20.0
 
 
 def _dui(ch):
     """兑 — 中心-环绕颜色对比度，无压缩"""
     device = ch.device
-    sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
-                         dtype=ch.dtype, device=ch.device)
-    gx = F.conv2d(ch, sobel, padding=1)
-    gy = F.conv2d(ch, sobel.transpose(2,3), padding=1)
-    energy = torch.sqrt(gx**2 + gy**2 + 1e-6)
-    ctr = _box_filter(ch, k=5)
-    sr = _box_filter(ch, k=15)
-    ct = sr - ctr
-    cv = ct * energy  # 对比度 × 边缘能量
-    gx2 = F.conv2d(ct, sobel, padding=1)
-    gy2 = F.conv2d(ct, sobel.transpose(2,3), padding=1)
-    asy = torch.sqrt(gx2**2 + gy2**2 + 1e-6) * 10.0 * energy
-    return torch.max(cv, asy)
+def _dui(ch):
+    """兑 — 泽/开口/缺损。局部表面不连续 = 中心与周围差异。"""
+    center = _box_filter(ch, k=5)
+    surround = _box_filter(ch, k=21)
+    return torch.abs(surround - center) * 5.0
 
 
 # 算子注册表
