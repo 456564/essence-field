@@ -62,9 +62,10 @@ class MultiDimOperatorLayer(nn.Module):
         multi_maps = []
         for name in BAGUA_OPERATORS:
             out = base_maps[name]
-            # 算子输出的强度图范围差异大（1/方差可达上万），
-            # 除以每算子自身的全局最大值，保持非负和相对强度关系。
+            # /amax: 算子内部归一化到 [0,1]
             out = out / (out.amax(dim=(2, 3), keepdim=True) + 1e-6)
+            # /median均衡: 算子间量级对齐，保证连通完整
+            out = out / (out.quantile(0.5) + 1e-6)
             feat = self.projections[name](out)
             multi_maps.append(feat)
         return torch.stack(multi_maps, dim=1)
