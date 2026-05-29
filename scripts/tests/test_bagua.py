@@ -16,7 +16,7 @@ import torch
 from torchvision import transforms
 
 # 确保项目根目录在路径中
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from src.model import HexagramModel
 from src.subnets import BAGUA_REGISTRY

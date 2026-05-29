@@ -8,7 +8,7 @@
 
 import sys, torch, cv2, numpy as np
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from src.pipeline import BaguaPipeline
 import matplotlib.pyplot as plt
