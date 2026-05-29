@@ -22,7 +22,7 @@ pipe = BaguaPipeline(d=8).to(device).eval()
 
 # 加载训练后的权重
 ckpt = torch.load("checkpoints/bootstrap_epoch20.pth", map_location=device)
-pipe.fusion.A.data = ckpt['A']
+pipe.fusion.W_up.data = ckpt.get("W_up", ckpt.get("A")); pipe.fusion.W_dn.data = ckpt.get("W_dn", ckpt.get("A"))
 pipe.operator_layer.projections.load_state_dict(ckpt['proj'])
 print("加载了训练后的权重")
 

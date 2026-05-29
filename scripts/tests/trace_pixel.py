@@ -94,7 +94,7 @@ pipe = BaguaPipeline().to(device).eval()
 ckpt_path = sorted(glob.glob('checkpoints_fixedcolor/bootstrap_epoch*.pth'))[-1]
 print(f'  权重来源: {ckpt_path}')
 ckpt = torch.load(ckpt_path, map_location=device)
-pipe.fusion.A.data = ckpt['A']
+pipe.fusion.W_up.data = ckpt.get("W_up", ckpt.get("A")); pipe.fusion.W_dn.data = ckpt.get("W_dn", ckpt.get("A"))
 pipe.operator_layer.projections.load_state_dict(ckpt['proj'])
 
 with torch.no_grad():

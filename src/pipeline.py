@@ -26,19 +26,21 @@ except ImportError:
 
 class BilinearFusion(nn.Module):
     """
-    可学习双线性融合
-    输入：8×8 特征矩阵 F（每像素）
-    输出：8×8 交互矩阵（64 维）
+    双投影双线性融合 — 上卦/下卦各独立投影，生成64卦有序对。
+    field[i*8+j] = F_up[i]·F_dn[j], 非对称, 卦纯可追溯。
     """
     def __init__(self, d=8):
         super().__init__()
-        self.A = nn.Parameter(torch.eye(d) + torch.randn(d, d) * 0.02)
+        self.W_up = nn.Parameter(torch.eye(d) + torch.randn(d, d) * 0.02)
+        self.W_dn = nn.Parameter(torch.eye(d) + torch.randn(d, d) * 0.02)
 
     def forward(self, F):
         B, n_ops, d, H, W = F.shape
-        F_perm = F.permute(0, 3, 4, 1, 2)  # [B, H, W, 8, d]
-        FA = torch.matmul(F_perm, self.A)
-        interact = torch.matmul(FA, F_perm.transpose(-1, -2))  # [B, H, W, 8, 8]
+        Fu = torch.einsum('bnihw,km->bnmhw', F, self.W_up)  # [B,8,8,H,W] 上卦投影
+        Fd = torch.einsum('bnihw,km->bnmhw', F, self.W_dn)  # [B,8,8,H,W] 下卦投影
+        Fu = Fu.permute(0, 3, 4, 1, 2)  # [B,H,W,8,8]
+        Fd = Fd.permute(0, 3, 4, 1, 2)
+        interact = torch.matmul(Fu, Fd.transpose(-1, -2))  # [B,H,W,8,8]
         hexagram = interact.reshape(B, H, W, n_ops * n_ops).permute(0, 3, 1, 2)
         return hexagram
 

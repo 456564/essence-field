@@ -44,7 +44,7 @@ def main():
     ckpt_path = sorted(glob.glob("checkpoints_fixedcolor/bootstrap_epoch*.pth"))[-1]
     print(f"加载: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.fusion.A.data = ckpt['A']
+    model.fusion.W_up.data = ckpt.get("W_up", ckpt.get("A")); model.fusion.W_dn.data = ckpt.get("W_dn", ckpt.get("A"))
     model.operator_layer.projections.load_state_dict(ckpt['proj'])
     print("加载了训练后的权重")
 

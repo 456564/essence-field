@@ -18,7 +18,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ─── 加载训练后的模型 ───
 model_trained = BaguaPipeline(d=8).to(device)
 checkpoint = torch.load("checkpoints/bootstrap_epoch20.pth", map_location=device)
-model_trained.fusion.A.data = checkpoint['A']
+model_trained.fusion.W_up.data = checkpoint.get("W_up", checkpoint.get("A")); model_trained.fusion.W_dn.data = checkpoint.get("W_dn", checkpoint.get("A"))
 model_trained.operator_layer.projections.load_state_dict(checkpoint['proj'])
 print("加载了训练后的权重")
 

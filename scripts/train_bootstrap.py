@@ -35,10 +35,11 @@ def train(args):
 
     model = BaguaPipeline().to(device)
 
-    # 冻结所有参数，仅解冻 A 核、投影层、颜色卷积层
+    # 冻结所有参数，仅解冻 W_up/W_dn、投影层、颜色卷积层
     for param in model.parameters():
         param.requires_grad = False
-    model.fusion.A.requires_grad = True
+    model.fusion.W_up.requires_grad = True
+    model.fusion.W_dn.requires_grad = True
     for param in model.operator_layer.projections.parameters():
         param.requires_grad = True
     
@@ -48,7 +49,7 @@ def train(args):
             param.requires_grad = True
 
     optimizer = torch.optim.Adam([
-        {'params': [model.fusion.A], 'lr': args.lr_A},
+        {'params': [model.fusion.W_up, model.fusion.W_dn], 'lr': args.lr_A},
         {'params': model.operator_layer.projections.parameters(), 'lr': args.lr_proj},
     ])
     # 如果存在颜色卷积，加进去（用稍高的学习率）
@@ -58,7 +59,7 @@ def train(args):
             optimizer.add_param_group({'params': color_params, 'lr': args.lr_A * 3})
 
     print(f"可训练参数:")
-    print(f"  A 核: {model.fusion.A.numel()} 个参数")
+    print(f"  W_up/dn: {model.fusion.W_up.numel()+model.fusion.W_dn.numel()} 个参数")
     proj_params = sum(p.numel() for p in model.operator_layer.projections.parameters())
     print(f"  投影层: {proj_params} 个参数")
     if hasattr(model.operator_layer.base_ops, 'parameters'):
@@ -123,7 +124,8 @@ def train(args):
             optimizer.step()
             for proj in model.operator_layer.projections.values():
                 proj.weight.data.clamp_(min=0)
-            model.fusion.A.data.clamp_(min=0)
+            model.fusion.W_up.data.clamp_(min=0)
+            model.fusion.W_dn.data.clamp_(min=0)
             scheduler.step()
 
             total_loss += loss.item()
@@ -147,7 +149,8 @@ def train(args):
         if (epoch + 1) % args.save_every == 0:
             os.makedirs(args.save_dir, exist_ok=True)
             save_dict = {
-                'A': model.fusion.A.data,
+                'W_up': model.fusion.W_up.data,
+                'W_dn': model.fusion.W_dn.data,
                 'proj': model.operator_layer.projections.state_dict(),
                 'epoch': epoch + 1,
             }
