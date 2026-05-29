@@ -64,8 +64,8 @@ class MultiDimOperatorLayer(nn.Module):
             out = base_maps[name]
             # /amax: 算子内部归一化到 [0,1]
             out = out / (out.amax(dim=(2, 3), keepdim=True) + 1e-6)
-            # /median均衡: 算子间量级对齐，保证连通完整
-            out = out / (out.quantile(0.5) + 1e-6)
+            # /q90均衡: 活跃像素代表值≈1，稀疏密集均公平
+            out = out / (out.quantile(0.9) + 1e-6)
             feat = self.projections[name](out)
             multi_maps.append(feat)
         return torch.stack(multi_maps, dim=1)

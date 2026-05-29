@@ -1,12 +1,13 @@
 """场自连接: 像素之间通过64维签名相似度自组物体"""
 import sys; from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-import torch, numpy as np, cv2, glob, matplotlib
+import torch, numpy as np, cv2, glob, matplotlib; from scipy.ndimage import binary_dilation
 matplotlib.use('Agg'); import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif']=['Microsoft YaHei']; plt.rcParams['axes.unicode_minus']=False
 
 device='cuda'
 from src.pipeline import BaguaPipeline
+from src.visualize import blended_gua_response
 
 pipe=BaguaPipeline().to(device).eval()
 pipe.fusion.W_up.data=torch.eye(8,device=device)
@@ -87,22 +88,23 @@ for row,(name,img) in enumerate(imgs):
     axes[row,1].imshow(norms.reshape(224,224),cmap='hot',vmin=norms.min(),vmax=norms.max())
     axes[row,1].set_title(f'||field|| median={median:.0f}',fontsize=9); axes[row,1].axis('off')
 
-    # 连通域着色
-    colors=plt.cm.tab20(np.linspace(0,1,20))
-    rgb=np.ones((224,224,3))*0.2  # 背景灰
-    for lid,sz in sorted(comps,key=lambda x:-x[1])[:10]:
-        c=colors[lid%20]
-        rgb[labels==lid]=c[:3]
-    axes[row,2].imshow(rgb); axes[row,2].set_title(f'{len(comps)} objects\n{len(comps)} components',fontsize=9)
+    # 融合色: 8卦颜色加权混合 = 该像素全部信息
+    blended=blended_gua_response(field)
+    axes[row,2].imshow(blended); axes[row,2].set_title(f'{len(comps)} obj\n融合色(8卦加权混)',fontsize=9)
     axes[row,2].axis('off')
 
-    # 叠加原图
-    over=img.copy()*0.4
-    for lid,sz in sorted(comps,key=lambda x:-x[1])[:10]:
-        c=colors[lid%20]
-        mask=(labels==lid)
-        over[mask]=over[mask]*0.3+np.array(c[:3])*0.7
-    axes[row,3].imshow(over.clip(0,1)); axes[row,3].set_title('overlay',fontsize=9)
+    # 连通域边界叠加
+    over=img.copy()*0.5
+    for lid,sz in sorted(comps,key=lambda x:-x[1])[:5]:
+        yy,xx=np.where(labels==lid)
+        if len(yy)>0:
+            edge=np.zeros((224,224))
+            edge[yy,xx]=1
+            e2=binary_dilation(edge,iterations=1)
+            boundary=e2.astype(float)-edge.astype(float)
+            bm=boundary>0
+            over[bm]=[1,0.9,0.2]  # 金色边界
+    axes[row,3].imshow(over.clip(0,1)); axes[row,3].set_title('边界叠加',fontsize=9)
     axes[row,3].axis('off')
 
     # 打印配方 (64维→8卦强度)

@@ -79,11 +79,16 @@ def _kun(ch):
 
 
 def _zhen(ch):
-    """震 — 颜色拉普拉斯幅值，无压缩"""
-    k = torch.tensor([[[[0, -1, 0], [-1, 4, -1], [0, -1, 0]]]],
-                     dtype=ch.dtype, device=ch.device)
-    lap = F.conv2d(ch, k, padding=1)
-    return torch.abs(lap) * 5.0
+    """震 — 变化/激活度。多尺度Laplacian, 宽窄边缘都抓。"""
+    device = ch.device
+    out = 0
+    for s in [1, 2]:
+        k = s*2+1  # 3×3, 5×5
+        w = torch.ones(1,1,k,k,device=device,dtype=ch.dtype)/(k*k)
+        smooth = F.conv2d(ch,w,padding=k//2)
+        lap = torch.abs(ch - smooth)  # 自身 vs 平滑 = 变化量
+        out = out + lap
+    return out * 3.0
 
 
 def _xun(ch):

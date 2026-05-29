@@ -35,7 +35,7 @@ def train(args):
 
     model = BaguaPipeline().to(device)
 
-    # 冻结所有参数，仅解冻 W_up/W_dn、投影层、颜色卷积层
+    # 冻结所有参数，仅解冻 W_up/W_dn、投影层
     for param in model.parameters():
         param.requires_grad = False
     model.fusion.W_up.requires_grad = True
