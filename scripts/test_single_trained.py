@@ -68,10 +68,9 @@ for row, (img_name, img_path) in enumerate(img_paths):
     ax.axis('off')
 
     ax = axes[row, 1]
-    # 最强卦复合图：每个像素着色 = 响应最强的卦的专属颜色 × 强度
     comp = argmax_gua_composite(field, img_small)
     ax.imshow(comp)
-    ax.set_title("最强卦复合（8卦颜色映射）", fontsize=9)
+    ax.set_title("最强卦复合（每像素主卦着色）", fontsize=9)
     ax.axis('off')
 
     ax = axes[row, 2]

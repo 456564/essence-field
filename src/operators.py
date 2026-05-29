@@ -96,19 +96,21 @@ def _kun(ch):
     # 2. 软边界：边缘→0，内部→1
     interior = 1.0 - torch.tanh(edge * 2.0)
 
-    # 3. 大核模糊 = 距离扩散（边缘影响传播到内部）
+    # 3. 大核模糊 = 距离扩散（镜像填充避免边界伪影）
     ksize = min(51, min(H, W) - 2)
     if ksize % 2 == 0:
         ksize -= 1
+    pad = ksize // 2
+    interior_padded = F.pad(interior, [pad, pad, pad, pad], mode='reflect')
     box = torch.ones(1, 1, ksize, ksize, device=device, dtype=ch.dtype) / (ksize * ksize)
-    depth = F.conv2d(interior, box, padding=ksize // 2)
+    depth = F.conv2d(interior_padded, box)
 
     # 4. 颜色一致性
     local_mean = _box_filter(ch, k=9)
     local_var = _box_filter((ch - local_mean)**2, k=9) + 1e-6
     consistency = 1.0 / (local_var * 50.0 + 1.0)
 
-    return depth * consistency  # 平坦=局部方差小=输出大
+    return depth * consistency * 10.0  # 平坦=局部方差小=输出大
 
 
 def _zhen(ch):
