@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.pipeline import BaguaPipeline
+from src.visualize import argmax_gua_composite
 import matplotlib.pyplot as plt
 
 plt.rcParams['font.family'] = 'sans-serif'
@@ -19,7 +20,7 @@ plt.rcParams['axes.unicode_minus'] = False
 device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = BaguaPipeline(d=8).to(device).eval()
 
-ckpt = torch.load("checkpoints_fixedcolor/bootstrap_epoch15.pth", map_location=device)
+ckpt = torch.load("checkpoints_fixedcolor/bootstrap_epoch10.pth", map_location=device)
 pipe.fusion.A.data = ckpt['A']
 pipe.operator_layer.projections.load_state_dict(ckpt['proj'])
 print("加载了训练后的权重")
@@ -67,11 +68,10 @@ for row, (img_name, img_path) in enumerate(img_paths):
     ax.axis('off')
 
     ax = axes[row, 1]
-    norms_np = norms.cpu().numpy()
-    vmin = np.percentile(norms_np, 5)
-    vmax = np.percentile(norms_np, 98)
-    ax.imshow(norms_np, cmap='hot', vmin=vmin, vmax=vmax)
-    ax.set_title("活跃度热力图（实时范数）", fontsize=9)
+    # 最强卦复合图：每个像素着色 = 响应最强的卦的专属颜色 × 强度
+    comp = argmax_gua_composite(field, img_small)
+    ax.imshow(comp)
+    ax.set_title("最强卦复合（8卦颜色映射）", fontsize=9)
     ax.axis('off')
 
     ax = axes[row, 2]

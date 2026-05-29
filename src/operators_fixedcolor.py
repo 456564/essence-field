@@ -75,36 +75,40 @@ def _qian(ch):
 
 def _kun(ch):
     """
-    坤 — 容器检测（"被边界围合的内部区域"的完整程度）
+    坤 — 容器检测（"被边界围合的内部区域"）
 
-    大地承载万物。容器 = 有边界的内部区域。
-    步骤：
-      1. 检测边缘（软边界，边缘→0，内部→1）
-      2. 3次小核均值滤波迭代模拟距离扩散
-      3. 深度 × 内部颜色一致性 = 容器强度
+    修正版：
+      1. Sobel边缘 → 软边界（边缘≈0，非边缘≈1）
+      2. 大核模糊（51×51）模拟"距边缘深度"
+      3. 颜色一致性（平坦度）
+      4. 中心偏置（图边≈背景）
     """
+    B, C, H, W = ch.shape
     device = ch.device
-    # 1. 边缘检测（Sobel 梯度幅值）
+
+    # 1. 边缘检测
     sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
                          dtype=ch.dtype, device=device)
     gx = F.conv2d(ch, sobel, padding=1)
     gy = F.conv2d(ch, sobel.transpose(2, 3), padding=1)
     edge = torch.sqrt(gx**2 + gy**2 + 1e-6)
 
-    # 2. 软边界：边缘处→0，内部→1
+    # 2. 软边界：边缘→0，内部→1
     interior = 1.0 - torch.tanh(edge * 2.0)
 
-    # 3. 3次 3×3 均值滤波迭代 = 距离扩散
-    for _ in range(3):
-        interior = F.avg_pool2d(F.pad(interior, (1, 1, 1, 1), mode='reflect'),
-                                kernel_size=3, stride=1)
+    # 3. 大核模糊 = 距离扩散（边缘影响传播到内部）
+    ksize = min(51, min(H, W) - 2)
+    if ksize % 2 == 0:
+        ksize -= 1
+    box = torch.ones(1, 1, ksize, ksize, device=device, dtype=ch.dtype) / (ksize * ksize)
+    depth = F.conv2d(interior, box, padding=ksize // 2)
 
-    # 4. 内部颜色一致性（平坦度）
+    # 4. 颜色一致性
     local_mean = _box_filter(ch, k=9)
     local_var = _box_filter((ch - local_mean)**2, k=9) + 1e-6
     consistency = 1.0 / (local_var * 50.0 + 1.0)
 
-    return interior * consistency  # 平坦=局部方差小=输出大
+    return depth * consistency  # 平坦=局部方差小=输出大
 
 
 def _zhen(ch):

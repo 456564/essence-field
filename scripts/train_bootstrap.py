@@ -152,6 +152,15 @@ def train(args):
             torch.save(save_dict, path)
             print(f"  已保存: {path}")
 
+            # 生成最强卦复合图（取第一批数据的第一张）
+            from src.visualize import argmax_gua_composite
+            img_np = (img[0].cpu().permute(1,2,0).numpy() * 255).astype(np.uint8)
+            comp = argmax_gua_composite(field.detach(), img_np)
+            comp_path = os.path.join(args.save_dir, f'epoch{epoch+1:02d}_composite.png')
+            import cv2
+            cv2.imwrite(comp_path, cv2.cvtColor(comp, cv2.COLOR_RGB2BGR))
+            tqdm.write(f"  复合图: {comp_path}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
