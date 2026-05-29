@@ -105,10 +105,12 @@ def compute_metrics(sal_map, gt_map):
     gt_norm = (gt - gt.mean()) / (gt.std() + 1e-8)
     cc = (sal_norm * gt_norm).mean()
 
-    # SIM（直方图交集）
+    # SIM（直方图交集，0~1）
     bins = 255
-    h_sal, _ = np.histogram(sal, bins=bins, range=(0,1), density=True)
-    h_gt, _ = np.histogram(gt, bins=bins, range=(0,1), density=True)
+    h_sal, _ = np.histogram(sal, bins=bins, range=(0,1), density=False)
+    h_gt, _ = np.histogram(gt, bins=bins, range=(0,1), density=False)
+    h_sal = h_sal / h_sal.sum()
+    h_gt = h_gt / h_gt.sum()
     sim = np.minimum(h_sal, h_gt).sum()
 
     return mae, auc, cc, sim

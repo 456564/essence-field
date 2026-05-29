@@ -19,7 +19,7 @@ plt.rcParams['axes.unicode_minus'] = False
 device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = BaguaPipeline(d=8).to(device).eval()
 
-ckpt = torch.load("checkpoints_fixedcolor/bootstrap_epoch10.pth", map_location=device)
+ckpt = torch.load("checkpoints_fixedcolor/bootstrap_epoch15.pth", map_location=device)
 pipe.fusion.A.data = ckpt['A']
 pipe.operator_layer.projections.load_state_dict(ckpt['proj'])
 print("加载了训练后的权重")
