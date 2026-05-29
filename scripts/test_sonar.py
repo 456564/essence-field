@@ -6,7 +6,10 @@ import cv2
 
 device='cuda'
 model=BaguaPipeline().to(device).eval()
-ckpt=torch.load('checkpoints_fixedcolor/bootstrap_epoch15.pth',map_location=device)
+import glob
+ckpt_path=sorted(glob.glob('checkpoints_fixedcolor/bootstrap_epoch*.pth'))[-1]
+print(f'加载: {ckpt_path}')
+ckpt=torch.load(ckpt_path,map_location=device)
 model.fusion.A.data=ckpt['A']
 model.operator_layer.projections.load_state_dict(ckpt['proj'])
 

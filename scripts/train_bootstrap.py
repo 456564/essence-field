@@ -121,6 +121,9 @@ def train(args):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            for proj in model.operator_layer.projections.values():
+                proj.weight.data.clamp_(min=0)
+            model.fusion.A.data.clamp_(min=0)
             scheduler.step()
 
             total_loss += loss.item()

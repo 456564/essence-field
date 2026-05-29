@@ -32,7 +32,7 @@ class BilinearFusion(nn.Module):
     """
     def __init__(self, d=8):
         super().__init__()
-        self.A = nn.Parameter(torch.randn(d, d) * 0.1)
+        self.A = nn.Parameter(torch.eye(d) + torch.randn(d, d) * 0.02)
 
     def forward(self, F):
         B, n_ops, d, H, W = F.shape
@@ -52,7 +52,7 @@ class MultiDimOperatorLayer(nn.Module):
         super().__init__()
         self.base_ops = _BaseOps()
         self.projections = nn.ModuleDict({
-            name: nn.Conv2d(1, 8, 1) for name in BAGUA_OPERATORS
+            name: nn.Conv2d(1, 8, 1, bias=False) for name in BAGUA_OPERATORS
         })
 
     def forward(self, x):
@@ -61,8 +61,8 @@ class MultiDimOperatorLayer(nn.Module):
         for name in BAGUA_OPERATORS:
             out = base_maps[name]
             # 算子输出的强度图范围差异大（1/方差可达上万），
-            # 用无参数实例归一化稳定尺度，不改变相对强度关系。
-            out = F.instance_norm(out)
+            # 除以每算子自身的全局最大值，保持非负和相对强度关系。
+            out = out / (out.amax(dim=(2, 3), keepdim=True) + 1e-6)
             feat = self.projections[name](out)
             multi_maps.append(feat)
         return torch.stack(multi_maps, dim=1)

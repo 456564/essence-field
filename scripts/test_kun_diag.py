@@ -8,7 +8,10 @@ plt.rcParams['axes.unicode_minus'] = False
 
 device = 'cuda'
 pipe = BaguaPipeline(d=8).to(device).eval()
-ckpt = torch.load('checkpoints_fixedcolor/bootstrap_epoch15.pth', map_location=device)
+import glob
+ckpt_path = sorted(glob.glob('checkpoints_fixedcolor/bootstrap_epoch*.pth'))[-1]
+print(f'加载: {ckpt_path}')
+ckpt = torch.load(ckpt_path, map_location=device)
 pipe.fusion.A.data = ckpt['A']
 pipe.operator_layer.projections.load_state_dict(ckpt['proj'])
 
@@ -22,7 +25,7 @@ with torch.no_grad():
     ops_out = pipe.operator_layer.base_ops(x)
     kun_raw = ops_out['kun'][0, 0].cpu().numpy()
     field = pipe(x)
-    kun_in_field = field[0, 0:8, :, :].norm(dim=0).cpu().numpy()  # 坤的8维范数
+    kun_in_field = field[0, 8:16, :, :].norm(dim=0).cpu().numpy()  # 坤的8维范数(算子索引1→8:16)
 
 fig, axes = plt.subplots(1, 4, figsize=(16, 4))
 axes[0].imshow(kun_raw, cmap='hot', vmin=np.percentile(kun_raw, 2), vmax=np.percentile(kun_raw, 98))
