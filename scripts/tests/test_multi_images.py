@@ -3,7 +3,7 @@ import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve(
 import torch, numpy as np, cv2, argparse
 from pathlib import Path
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
-from src.operators import dong, jing
+from src.operators import dong, jing, gang
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 OUT = Path(__file__).resolve().parent.parent.parent / 'test_output'
@@ -23,39 +23,42 @@ def process_one(img_path, max_size=512):
     with torch.no_grad():
         d = dong(x)[0,0].cpu().numpy()
         j = jing(x)[0,0].cpu().numpy()
+        g = gang(x)[0,0].cpu().numpy()
     stats = {
         'name': img_path.stem, 'shape': img.shape[:2],
         'd_mean': d.mean(), 'd_max': d.max(), 'd_median': np.median(d),
         'j_mean': j.mean(), 'j_median': np.median(j),
+        'g_mean': g.mean(), 'g_max': g.max(),
     }
-    return img, d, j, stats
+    return img, d, j, g, stats
 
 def render_grid(results, out_name='multi_test.png'):
-    """Render all results in a grid"""
+    """Render all results in a 5-column grid"""
     n = len(results)
-    fig, axes = plt.subplots(n, 4, figsize=(16, 3*n))
+    fig, axes = plt.subplots(n, 5, figsize=(20, 3*n))
     if n == 1:
         axes = axes.reshape(1, -1)
-    for row, (img, d_map, j_map, st) in enumerate(results):
+    for row, (img, d_map, j_map, g_map, st) in enumerate(results):
         img_u8 = (np.clip(img,0,1)*255).astype(np.uint8)
         axes[row,0].imshow(img_u8)
         axes[row,0].set_title(f'{st["name"]}', fontsize=9)
         axes[row,0].axis('off')
-        vd = max(d_map.max(), 0.05)
-        axes[row,1].imshow(d_map, cmap='hot', vmin=0, vmax=vd)
-        axes[row,1].set_title(f'Dong [vmax={vd:.2f}]\nmean={st["d_mean"]:.3f} max={st["d_max"]:.3f}', fontsize=9)
+        axes[row,1].imshow(d_map, cmap='hot', vmin=0, vmax=0.5)
+        axes[row,1].set_title(f'Dong [0,0.5]\nmean={st["d_mean"]:.3f} max={st["d_max"]:.3f}', fontsize=9)
         axes[row,1].axis('off')
         axes[row,2].imshow(j_map, cmap='Blues', vmin=0, vmax=1)
         axes[row,2].set_title(f'Jing\nmean={st["j_mean"]:.3f}', fontsize=9)
         axes[row,2].axis('off')
-        # Overlay
-        ds = np.clip(d_map/max(d_map.max(),0.01), 0, 1)
-        ov = np.stack([ds, np.zeros_like(d_map), j_map], axis=-1)
-        axes[row,3].imshow(img_u8)
-        axes[row,3].imshow(ov, alpha=0.5)
-        axes[row,3].set_title('Overlay', fontsize=9)
+        axes[row,3].imshow(g_map, cmap='hot', vmin=0, vmax=0.5)
+        axes[row,3].set_title(f'Gang [0,0.5]\nmean={st["g_mean"]:.3f} max={st["g_max"]:.3f}', fontsize=9)
         axes[row,3].axis('off')
-    plt.suptitle(f'Dong/Jing — {n} images', fontsize=12, fontweight='bold')
+        # Overlay: red=gang, green=dong
+        ds=np.clip(d_map/max(d_map.max(),0.01),0,1); gs=np.clip(g_map/max(max(g_map.max(),0.01),0.01),0,1)
+        ov=np.stack([gs, ds*0.5, np.zeros_like(d_map)], axis=-1)
+        axes[row,4].imshow(img_u8); axes[row,4].imshow(ov, alpha=0.5)
+        axes[row,4].set_title('Red=Gang Green=Dong', fontsize=9)
+        axes[row,4].axis('off')
+    plt.suptitle(f'Dong → Jing → Gang — {n} images', fontsize=12, fontweight='bold')
     plt.tight_layout()
     out_path = OUT / out_name
     fig.savefig(out_path, dpi=120, bbox_inches='tight', facecolor='white')
@@ -108,8 +111,8 @@ def main():
         r = process_one(fp)
         if r:
             results.append(r)
-            st = r[3]
-            print(f'dong max={st["d_max"]:.3f} mean={st["d_mean"]:.3f}')
+            st = r[4]
+            print(f'dong={st["d_max"]:.3f} gang={st["g_max"]:.3f}')
         else:
             print('FAILED')
 

@@ -2,6 +2,8 @@
 from .operators import (
     dong,
     jing,
+    gang,
+    rou,
     PhysicalOperatorLayer,
     PHYSICAL_OPERATORS,
 )

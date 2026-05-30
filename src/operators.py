@@ -103,22 +103,50 @@ def dong(x):
     return _normalize_by_max(mag)       # /6.928 保留强度量纲
 
 
+def _jing_from_dong(d):
+    """静 = 1/(1+dong*10)。输入 dong [B,1,H,W]，输出 [B,1,H,W]"""
+    return 1.0 / (1.0 + d * 10.0)
+
+
 def jing(x):
+    """静 — RGB 兼容封装。Layer 内走 _jing_from_dong 跳过冗余计算。"""
+    return _jing_from_dong(dong(x))
+
+
+# ═══════════════════════════════════════════════════════════════
+# 第2层：依赖动/静
+# ═══════════════════════════════════════════════════════════════
+
+def _gang_from_dong(d):
     """
-    静 — 无变化区域（动的互补）
-
-    物理量：该像素邻域内 RGB 的一致性。
-    jing = 1 / (1 + dong * scale)
-
-    输入: [B, 3, H, W] RGB 图像
-    输出: [B, 1, H, W] 非负，[0, 1]
-
-    高值区：平坦背景、均匀表面
-    低值区：边缘、纹理密集区
+    刚 = (dong - box_filter(dong,k=7)).clamp(min=0)
+    输入 dong [B,1,H,W]，输出 [B,1,H,W]
     """
-    d = dong(x)                         # 动响应
-    j = 1.0 / (1.0 + d * 10.0)         # 动越大 → 静越小
-    return j
+    d_local = _box_filter(d, k=7)
+    return (d - d_local).clamp(min=0)
+
+
+def gang(x):
+    """刚 — RGB 兼容封装。Layer 内走 _gang_from_dong 跳过冗余计算。"""
+    return _gang_from_dong(dong(x))
+
+
+# ═══════════════════════════════════════════════════════════════
+
+def _rou_from_dong_gang(d, g):
+    """
+    柔 = (dong - gang).clamp(min=0)
+    动里减去刚=保留分散变化（软过渡+纹理）
+    输入 dong [B,1,H,W], gang [B,1,H,W]，输出 [B,1,H,W]
+    """
+    return (d - g).clamp(min=0)
+
+
+def rou(x):
+    """柔 — RGB 兼容封装。Layer 内走 _rou_from_dong_gang 跳过冗余计算。"""
+    d = dong(x)
+    g = _gang_from_dong(d)
+    return _rou_from_dong_gang(d, g)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -128,9 +156,9 @@ def jing(x):
 PHYSICAL_OPERATORS = {
     'dong': dong,  # 动=变化
     'jing': jing,  # 静=恒定
-    # 以下算子依赖动/静，待实现：
-    # 'gang': gang,  # 刚=硬边界 (需动)
-    # 'rou':  rou,   # 柔=软纹理 (需动+静)
+    'gang': gang,  # 刚=硬边界 (需动)
+    'rou':  rou,   # 柔=软纹理 (需动+刚)
+    # 以下算子待实现：
     # 'ju':   ju,    # 聚=围合   (需刚)
     # 'san':  san,   # 散=开放   (需刚+柔)
     # 'yang': yang,  # 阳=实体   (需聚)
@@ -140,21 +168,31 @@ PHYSICAL_OPERATORS = {
 
 class PhysicalOperatorLayer(nn.Module):
     """
-    8 物理算子层
-    输入 RGB → 输出 8 通道响应 [B, 8, H, W]
-    当前已实现：动、静（2/8）
+    8 物理算子层 — 按依赖链编排，避免冗余计算
+
+    RGB → dong ─┬→ jing
+                ├→ gang ─→ rou
+                └→ (ju, san, yang, yin 待实现)
     """
 
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
-        maps = []
-        for name in ['dong', 'jing']:  # 按依赖序
-            out = PHYSICAL_OPERATORS[name](x)
-            maps.append(out.squeeze(1))  # [B,H,W]
-        # 未实现的算子填零占位
         B, _, H, W = x.shape
+
+        # L1: 像素直接可测
+        d = dong(x)                        # [B,1,H,W] 算一次
+
+        # L2: 依赖动
+        j = _jing_from_dong(d)             # [B,1,H,W]
+        g = _gang_from_dong(d)             # [B,1,H,W]
+        r = _rou_from_dong_gang(d, g)      # [B,1,H,W]
+
+        maps = [d, j, g, r]
+
+        # 未实现的算子填零占位
         for _ in range(len(maps), 8):
-            maps.append(torch.zeros(B, H, W, device=x.device))
-        return torch.stack(maps, dim=1)  # [B,8,H,W]
+            maps.append(torch.zeros(B, 1, H, W, device=x.device))
+
+        return torch.cat(maps, dim=1)  # [B,8,H,W]
