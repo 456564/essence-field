@@ -73,15 +73,43 @@ class MultiDimOperatorLayer(nn.Module):
 
 class BaguaPipeline(nn.Module):
     """
-    八卦流水线
-    输入 [B, 3, H, W] → 64 维卦象场 [B, 64, H, W]
+    八卦流水线 — 双层抽象
+    L1: RGB → 8算子几何 → 64维表象场
+    L2: L1场8卦强度图 → [8→1]可学亲和 → 64维抽象场
     """
-    def __init__(self, d=8):
+    def __init__(self, d=8, n_layers=1):
         super().__init__()
+        self.n_layers = n_layers
         self.operator_layer = MultiDimOperatorLayer()
         self.fusion = BilinearFusion(d=d)
+        # L2: 8→1 亲和权重 (每个算子学自己对8卦的偏好) + 1→8投影
+        if n_layers >= 2:
+            from .operators import BAGUA_OPERATORS
+            self.l2_affinity = nn.ModuleDict({
+                name: nn.Conv2d(8, 1, 1, bias=False) for name in BAGUA_OPERATORS
+            })
+            self.l2_project = nn.ModuleDict({
+                name: nn.Conv2d(1, 8, 1, bias=False) for name in BAGUA_OPERATORS
+            })
 
     def forward(self, x):
-        multi_feat = self.operator_layer(x)    # [B, 8, 8, H, W]
-        hexagram = self.fusion(multi_feat)      # [B, 64, H, W]
-        return hexagram
+        field = self.fusion(self.operator_layer(x))  # L1 表象场
+
+        if self.n_layers >= 2:
+            B, C, H, W = field.shape
+            # L1场 → 8卦强度图
+            strength = torch.stack([
+                field[:, i*8:(i+1)*8].norm(dim=1) for i in range(8)
+            ], dim=1)  # [B,8,H,W]
+            strength = strength / (strength.amax(dim=(2,3), keepdim=True) + 1e-6)
+
+            l2_maps = []
+            for name in self.l2_affinity:
+                aff = self.l2_affinity[name](strength).clamp(min=0)  # [B,1,H,W]
+                aff = aff / (aff.amax(dim=(2,3), keepdim=True) + 1e-6)
+                aff = aff / (aff.quantile(0.5) + 1e-6)
+                feat = self.l2_project[name](aff)
+                l2_maps.append(feat)
+            field = self.fusion(torch.stack(l2_maps, dim=1))  # L2 抽象场
+
+        return field
