@@ -1,3 +1,8 @@
-"""八卦→64卦 视觉架构核心库"""
-from .subnets import BAGUA_REGISTRY
-from .model import HexagramModel
+"""物理本质空间 — 8物理算子视觉架构"""
+from .operators import (
+    dong,
+    jing,
+    PhysicalOperatorLayer,
+    PHYSICAL_OPERATORS,
+)
+from .pipeline import PhysicalPipeline

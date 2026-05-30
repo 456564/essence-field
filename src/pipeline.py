@@ -1,115 +1,63 @@
 """
-八卦→64卦 流水线
+物理算子流水线
 
-核心数据结构：64 维卦象场 [B, 64, H, W]
-  - 每个像素有自己的 64 维向量
-  - 同一物质的像素有相似的 64 维向量
-  - 64 维向量不是图片级别的描述，是像素级别的
+RGB → 8物理算子 → 投影 → 64维本质场
 
-任何取全图均值的做法都是错误的。
+简化版：单投影无融合。先验证算子有效性，后续再加双投影融合。
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from .operators import BAGUA_OPERATORS
+from .operators import PhysicalOperatorLayer
 
-# 算子层选择：colormod 版用 nn.Module 实现
-try:
-    from .operators import ColorModulatedOperatorLayer as _BaseOps
-    _HAS_COLORMOD = True
-except ImportError:
-    from .operators import BaguaOperatorLayer as _BaseOps
-    _HAS_COLORMOD = False
+PHYSICAL_OPERATOR_NAMES = ['dong', 'jing', 'gang', 'rou', 'ju', 'san', 'yang', 'yin']
 
 
-class BilinearFusion(nn.Module):
+class PhysicalPipeline(nn.Module):
     """
-    双投影双线性融合 — 上卦/下卦各独立投影，生成64卦有序对。
-    field[i*8+j] = F_up[i]·F_dn[j], 非对称, 卦纯可追溯。
-    """
-    def __init__(self, d=8):
-        super().__init__()
-        self.W_up = nn.Parameter(torch.eye(d) + torch.randn(d, d) * 0.02)
-        self.W_dn = nn.Parameter(torch.eye(d) + torch.randn(d, d) * 0.02)
+    物理算子流水线 — 单层
 
-    def forward(self, F):
-        B, n_ops, d, H, W = F.shape
-        Fu = torch.einsum('bnihw,km->bnmhw', F, self.W_up)  # [B,8,8,H,W] 上卦投影
-        Fd = torch.einsum('bnihw,km->bnmhw', F, self.W_dn)  # [B,8,8,H,W] 下卦投影
-        Fu = Fu.permute(0, 3, 4, 1, 2)  # [B,H,W,8,8]
-        Fd = Fd.permute(0, 3, 4, 1, 2)
-        interact = torch.matmul(Fu, Fd.transpose(-1, -2))  # [B,H,W,8,8]
-        hexagram = interact.reshape(B, H, W, n_ops * n_ops).permute(0, 3, 1, 2)
-        return hexagram
-
-
-class MultiDimOperatorLayer(nn.Module):
+    RGB [B,3,H,W]
+      ↓ PhysicalOperatorLayer
+    8 响应图 [B,8,H,W]
+      ↓ 1×1 conv 投影 (8→1 per operator → 8-dim each)
+    8×8 特征 [B,8,8,H,W]
+      ↓ reshape
+    64 维本质场 [B,64,H,W]
     """
-    多维算子层
-    每个算子输出 8 维特征 → [B, 8, 8, H, W]
-    """
+
     def __init__(self):
         super().__init__()
-        self.base_ops = _BaseOps()
+        self.operator_layer = PhysicalOperatorLayer()
+        # 每个算子独立投影：1 通道 → 8 维
         self.projections = nn.ModuleDict({
-            name: nn.Conv2d(1, 8, 1, bias=False) for name in BAGUA_OPERATORS
+            name: nn.Conv2d(1, 8, 1, bias=False)
+            for name in PHYSICAL_OPERATOR_NAMES
         })
+        # 投影权重初始化为正值（非负约束）
+        for proj in self.projections.values():
+            nn.init.uniform_(proj.weight, 0.0, 0.5)
+            # 对角线初始化为 1（恒等偏好）
+            with torch.no_grad():
+                for i in range(min(proj.weight.shape[0], proj.weight.shape[1])):
+                    proj.weight[i, i] = 1.0
 
     def forward(self, x):
-        base_maps = self.base_ops(x)
-        multi_maps = []
-        for name in BAGUA_OPERATORS:
-            out = base_maps[name]
-            # /amax: 算子内部归一化到 [0,1]
-            out = out / (out.amax(dim=(2, 3), keepdim=True) + 1e-6)
-            # /q90均衡: 活跃像素代表值≈1，稀疏密集均公平
-            out = out / (out.quantile(0.9) + 1e-6)
-            feat = self.projections[name](out)
-            multi_maps.append(feat)
-        return torch.stack(multi_maps, dim=1)
+        base = self.operator_layer(x)  # [B, 8, H, W]
 
+        multi = []
+        for i, name in enumerate(PHYSICAL_OPERATOR_NAMES):
+            ch = base[:, i:i+1, :, :]                # [B, 1, H, W]
+            feat = self.projections[name](ch)          # [B, 8, H, W]
+            multi.append(feat)
 
-class BaguaPipeline(nn.Module):
-    """
-    八卦流水线 — 双层抽象
-    L1: RGB → 8算子几何 → 64维表象场
-    L2: L1场8卦强度图 → [8→1]可学亲和 → 64维抽象场
-    """
-    def __init__(self, d=8, n_layers=1):
-        super().__init__()
-        self.n_layers = n_layers
-        self.operator_layer = MultiDimOperatorLayer()
-        self.fusion = BilinearFusion(d=d)
-        # L2: 8→1 亲和权重 (每个算子学自己对8卦的偏好) + 1→8投影
-        if n_layers >= 2:
-            from .operators import BAGUA_OPERATORS
-            self.l2_affinity = nn.ModuleDict({
-                name: nn.Conv2d(8, 1, 1, bias=False) for name in BAGUA_OPERATORS
-            })
-            self.l2_project = nn.ModuleDict({
-                name: nn.Conv2d(1, 8, 1, bias=False) for name in BAGUA_OPERATORS
-            })
-
-    def forward(self, x):
-        field = self.fusion(self.operator_layer(x))  # L1 表象场
-
-        if self.n_layers >= 2:
-            B, C, H, W = field.shape
-            # L1场 → 8卦强度图
-            strength = torch.stack([
-                field[:, i*8:(i+1)*8].norm(dim=1) for i in range(8)
-            ], dim=1)  # [B,8,H,W]
-            strength = strength / (strength.amax(dim=(2,3), keepdim=True) + 1e-6)
-
-            l2_maps = []
-            for name in self.l2_affinity:
-                aff = self.l2_affinity[name](strength).clamp(min=0)  # [B,1,H,W]
-                aff = aff / (aff.amax(dim=(2,3), keepdim=True) + 1e-6)
-                aff = aff / (aff.quantile(0.5) + 1e-6)
-                feat = self.l2_project[name](aff)
-                l2_maps.append(feat)
-            field = self.fusion(torch.stack(l2_maps, dim=1))  # L2 抽象场
-
+        # [B, 8, 8, H, W] → [B, 64, H, W]
+        field = torch.cat([m.unsqueeze(1) for m in multi], dim=1)
+        B, n_ops, d, H, W = field.shape
+        field = field.reshape(B, n_ops * d, H, W)
         return field
+
+    def clamp_weights(self):
+        """投影权重 clamp ≥ 0，保持全管线非负"""
+        for proj in self.projections.values():
+            proj.weight.data.clamp_(min=0.0)
