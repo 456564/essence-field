@@ -1,9 +1,9 @@
-"""物理本质空间 — 8物理算子视觉架构"""
+"""物理本质空间 v2 — 4 物理算子"""
 from .operators import (
     dong,
-    jing,
     gang,
-    rou,
+    cu,
+    ju,
     PhysicalOperatorLayer,
     PHYSICAL_OPERATORS,
 )

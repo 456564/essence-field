@@ -1,23 +1,15 @@
 """
-物理算子 — 8个可验证物理量测量器
+物理算子 — 4个独立可测物理量
 
-依赖链（从像素可测 → 需要推理）：
-  动(梯度) ── 最底层，只依赖RGB差分
-  静(无变化) ── 动的互补
-    │
-    ├→ 刚(硬边界) ── 需要动定位边缘，大梯度+窄过渡带
-    ├→ 柔(软纹理) ── 需要动检测纹理密度，小梯度+宽分布
-    │     │
-    │     ├→ 聚(围合) ── 需要刚判定"被硬边界包围"
-    │     ├→ 散(开放) ── 不被包围的暴露区域
-    │           │
-    │           ├→ 阳(实体) ── 需要聚的产物：在物体内部
-    │           ├→ 阴(虚空) ── 聚的补集：在物体外部
+依赖链：
+  RGB → dong(梯度幅值) ─→ gang(梯度脊线)
+       ├→ cu(粗糙度)
+       └→ ju(围合度, 读gang)
 
 设计约束：
-  - 所有算子输出非负 [B, 1, H, W]
-  - 下层算子不依赖上层（动不读刚）
-  - 每个算子只测一种物理量，不混合语义
+  - 每个算子测一种客观物理量，不存在"X 的补集"
+  - 非负输出 [B, 1, H, W]
+  - 下层不依赖上层
 """
 
 import torch
@@ -26,127 +18,107 @@ import torch.nn.functional as F
 
 
 # ═══════════════════════════════════════════════════════════════
-# 工具函数
+# 工具
 # ═══════════════════════════════════════════════════════════════
 
 def _box_filter(x, k=5):
-    """Box 均值滤波，空间平滑（replicate 填充，边界外延不引入零）"""
+    """Box 均值滤波，replicate 填充。支持任意通道数。"""
+    C = x.shape[1]
     w = torch.ones(1, 1, k, k, device=x.device) / (k * k)
     p = k // 2
     x_pad = F.pad(x, (p, p, p, p), mode='replicate')
-    return F.conv2d(x_pad, w, padding=0)
+    return F.conv2d(x_pad, w.repeat(C, 1, 1, 1), padding=0, groups=C)
 
 
 def _sobel_magnitude(x):
-    """
-    Sobel 梯度幅值，三通道分别算后取 L2 范数。
-    输入 [B, 3, H, W]，输出 [B, 1, H, W]。
-    这是动算子的物理基础——RGB 空间变化量。
-    """
+    """Sobel 梯度幅值，三通道 L2 范数 → [B,1,H,W]"""
     device = x.device
-    # Sobel 核
-    kx = torch.tensor([[-1., 0., 1.],
-                       [-2., 0., 2.],
-                       [-1., 0., 1.]], device=device).view(1, 1, 3, 3)
-    ky = torch.tensor([[-1., -2., -1.],
-                       [ 0.,  0.,  0.],
-                       [ 1.,  2.,  1.]], device=device).view(1, 1, 3, 3)
-
-    # replicate padding: 边界像素外延，不创造对称抵消
+    kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+                       device=device).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]],
+                       device=device).view(1, 1, 3, 3)
     x_pad = F.pad(x, (1, 1, 1, 1), mode='replicate')
-    gx = F.conv2d(x_pad, kx.repeat(3, 1, 1, 1), padding=0, groups=3)  # [B,3,H,W]
+    gx = F.conv2d(x_pad, kx.repeat(3, 1, 1, 1), padding=0, groups=3)
     gy = F.conv2d(x_pad, ky.repeat(3, 1, 1, 1), padding=0, groups=3)
-
     mag = torch.sqrt(gx ** 2 + gy ** 2)  # [B,3,H,W]
-    # 三通道 L2 范数 → 单通道
-    mag = torch.norm(mag, dim=1, keepdim=True)  # [B,1,H,W]
-    return mag
+    return torch.norm(mag, dim=1, keepdim=True)  # [B,1,H,W]
 
 
-# Sobel 3×3 后 box_filter 抹平的实用最大响应
-# 理论 max = sqrt(48) ≈ 6.928（三通道全跳变）
-# box_filter(k=3) 抹平后 ≈ 4.62
-# 用 4.0 确保锐边 dong≈0.94，渐变 dong≈0.016
-_MAX_SOBEL = 4.0
-
-
-def _normalize_by_max(x):
-    """固定除数归一化：保留连续强度，弱梯度不消失"""
-    return torch.clamp(x / _MAX_SOBEL, 0.0, 1.0)
+_MAX_SOBEL = 5.0  # 实用最大 Sobel 响应（box 抹平后）
 
 
 # ═══════════════════════════════════════════════════════════════
-# 第1层：像素直接可测
+# 算子 1: 动 — 梯度幅值 (L0, RGB直接可测)
 # ═══════════════════════════════════════════════════════════════
 
 def dong(x):
     """
-    动 — 像素级变化强度（梯度幅值）
-
-    物理量：该位置 RGB 值在空间上的变化速率。
-    只依赖 RGB 差分，不依赖任何其他算子。
-
-    计算：
-      1. 三通道 Sobel 梯度
-      2. 三通道 L2 范数 → 单通道梯度幅值
-      3. Box 平滑去噪
-      4. /amax 归一化
-
-    输入: [B, 3, H, W] RGB 图像
-    输出: [B, 1, H, W] 非负梯度幅值，[0, 1]
-
-    高值区：边缘、纹理、噪声
-    低值区：平坦单色区域
+    动 — 梯度幅值（变化强度）
+    RGB → Sobel → box去噪 → /4.0归一化
+    输入 [B,3,H,W] → 输出 [B,1,H,W]，[0,1]
     """
-    mag = _sobel_magnitude(x)           # [B,1,H,W] 绝对梯度值
-    mag = _box_filter(mag, k=3)         # 去噪
-    return _normalize_by_max(mag)       # /6.928 保留强度量纲
-
-
-def _jing_from_dong(d):
-    """静 = 1/(1+dong*10)。输入 dong [B,1,H,W]，输出 [B,1,H,W]"""
-    return 1.0 / (1.0 + d * 10.0)
-
-
-def jing(x):
-    """静 — RGB 兼容封装。Layer 内走 _jing_from_dong 跳过冗余计算。"""
-    return _jing_from_dong(dong(x))
+    mag = _sobel_magnitude(x)
+    mag = _box_filter(mag, k=3)
+    return torch.clamp(mag / _MAX_SOBEL, 0.0, 1.0)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 第2层：依赖动/静
+# 算子 2: 刚 — 梯度脊线 (L1, 从动)
 # ═══════════════════════════════════════════════════════════════
 
 def _gang_from_dong(d):
-    """
-    刚 = (dong - box_filter(dong,k=7)).clamp(min=0)
-    输入 dong [B,1,H,W]，输出 [B,1,H,W]
-    """
-    d_local = _box_filter(d, k=7)
-    return (d - d_local).clamp(min=0)
+    """刚 = (dong - box(dong,7)).clamp(min=0)"""
+    return (d - _box_filter(d, k=7)).clamp(min=0)
 
 
 def gang(x):
-    """刚 — RGB 兼容封装。Layer 内走 _gang_from_dong 跳过冗余计算。"""
+    """刚 — 梯度脊线（硬边界）。RGB兼容封装。"""
     return _gang_from_dong(dong(x))
 
 
 # ═══════════════════════════════════════════════════════════════
+# 算子 3: 粗 — 局部纹理能量 (L0, RGB直接可测)
+# ═══════════════════════════════════════════════════════════════
 
-def _rou_from_dong_gang(d, g):
+def cu(x):
     """
-    柔 = (dong - gang).clamp(min=0)
-    动里减去刚=保留分散变化（软过渡+纹理）
-    输入 dong [B,1,H,W], gang [B,1,H,W]，输出 [B,1,H,W]
+    粗 — 局部 RGB 方差（表面粗糙度）
+
+    物理量：邻域内像素 RGB 的均方偏差。
+    平滑表面 ≈ 0，粗糙纹理 > 0。
+    独立于梯度——边缘处梯度高但纹理可能低。
+
+    cu = box((x - box(x,5))², k=7).mean(channel)
+
+    输入 [B,3,H,W] → 输出 [B,1,H,W]
     """
-    return (d - g).clamp(min=0)
+    local_mean = _box_filter(x, k=5)         # [B,3,H,W] 邻域均值
+    residual_sq = (x - local_mean) ** 2       # [B,3,H,W] 偏差平方
+    variance = _box_filter(residual_sq, k=7)  # [B,3,H,W] 局部方差
+    cu_raw = variance.mean(dim=1, keepdim=True)  # [B,1,H,W] 三通道均值
+    return torch.clamp(cu_raw / 0.08, 0.0, 1.0)  # /0.08: 理论max≈0.25, 实用≈0.08
 
 
-def rou(x):
-    """柔 — RGB 兼容封装。Layer 内走 _rou_from_dong_gang 跳过冗余计算。"""
-    d = dong(x)
-    g = _gang_from_dong(d)
-    return _rou_from_dong_gang(d, g)
+# ═══════════════════════════════════════════════════════════════
+# 算子 4: 聚 — 围合度 (L1, 从刚)
+# ═══════════════════════════════════════════════════════════════
+
+def _ju_from_gang(g):
+    """
+    聚 — 被硬边界包围的程度
+
+    物理量：该像素周围 31×31 窗口内刚的密度。
+    闭合轮廓内密度高，开放侧密度低。
+
+    ju = box_filter(gang, k=31) / 0.1
+    """
+    density = _box_filter(g, k=31)
+    return torch.clamp(density / 0.05, 0.0, 1.0)
+
+
+def ju(x):
+    """聚 — 围合度。RGB 兼容封装。"""
+    return _ju_from_gang(_gang_from_dong(dong(x)))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -154,45 +126,29 @@ def rou(x):
 # ═══════════════════════════════════════════════════════════════
 
 PHYSICAL_OPERATORS = {
-    'dong': dong,  # 动=变化
-    'jing': jing,  # 静=恒定
-    'gang': gang,  # 刚=硬边界 (需动)
-    'rou':  rou,   # 柔=软纹理 (需动+刚)
-    # 以下算子待实现：
-    # 'ju':   ju,    # 聚=围合   (需刚)
-    # 'san':  san,   # 散=开放   (需刚+柔)
-    # 'yang': yang,  # 阳=实体   (需聚)
-    # 'yin':  yin,   # 阴=虚空   (需聚)
+    'dong': dong,  # 动=梯度幅值 (L0)
+    'gang': gang,  # 刚=梯度脊线 (L1←动)
+    'cu':   cu,    # 粗=纹理能量 (L0)
+    'ju':   ju,    # 聚=围合度   (L1←刚)
 }
 
 
+# ═══════════════════════════════════════════════════════════════
+# 算子层
+# ═══════════════════════════════════════════════════════════════
+
 class PhysicalOperatorLayer(nn.Module):
     """
-    8 物理算子层 — 按依赖链编排，避免冗余计算
+    4 物理算子层 — 按依赖链编排
 
-    RGB → dong ─┬→ jing
-                ├→ gang ─→ rou
-                └→ (ju, san, yang, yin 待实现)
+    RGB → dong ─→ gang ─→ ju
+         └→ cu
     """
 
-    def __init__(self):
-        super().__init__()
-
     def forward(self, x):
-        B, _, H, W = x.shape
+        d = dong(x)                    # L0
+        g = _gang_from_dong(d)         # L1
+        c = cu(x)                      # L0 (独立)
+        j = _ju_from_gang(g)           # L1
 
-        # L1: 像素直接可测
-        d = dong(x)                        # [B,1,H,W] 算一次
-
-        # L2: 依赖动
-        j = _jing_from_dong(d)             # [B,1,H,W]
-        g = _gang_from_dong(d)             # [B,1,H,W]
-        r = _rou_from_dong_gang(d, g)      # [B,1,H,W]
-
-        maps = [d, j, g, r]
-
-        # 未实现的算子填零占位
-        for _ in range(len(maps), 8):
-            maps.append(torch.zeros(B, 1, H, W, device=x.device))
-
-        return torch.cat(maps, dim=1)  # [B,8,H,W]
+        return torch.cat([d, g, c, j], dim=1)  # [B,4,H,W]
