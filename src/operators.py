@@ -48,12 +48,15 @@ def _jing_from_dong(d):
 
 # ── 刚 ──
 def _gang_from_dong(d):
+    """硬边界 = 梯度比平滑梯度高的区域（比值×d，对软边缘更鲁棒）"""
     ridges = []
     for k in [3, 7, 15]:
-        ridges.append((d - _box_filter(d, k=k)).clamp(min=0))
+        smooth = _box_filter(d, k=k)
+        # 比值 > 1 → 该像素的梯度高于周围均值 → 脊线
+        ratio = (d + 1e-6) / (smooth + 1e-6)
+        ridges.append((ratio - 1.0).clamp(min=0) * d * 5.0)
     ridge = torch.stack(ridges, dim=0).max(dim=0)[0]
-    # Gray supplement
-    return ridge
+    return ridge.clamp(0.0, 1.0)
 
 
 def _gang_enhanced(x):
@@ -117,7 +120,7 @@ def _ju_from_gang_dist(g, dist_map):
         best = torch.max(best, covered)
     base_ju = best.clamp(0.0, 1.0)
     # interior_score: absolute distance threshold (not relative)
-    interior_score = torch.sigmoid((dist_map - 0.08) * 30.0)  # 边界→0, 内部→1
+    interior_score = torch.sigmoid((dist_map - 0.02) * 50.0)  # 边界→0, 内部→1
     # texture penalty: gang fragments → not enclosure
     gang_density = _box_filter(g, k=7)
     texture_penalty = (1.0 - gang_density * 10.0).clamp(0.0, 1.0)
