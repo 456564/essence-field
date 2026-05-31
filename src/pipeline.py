@@ -14,8 +14,8 @@ class BilinearFusion(nn.Module):
 
     def __init__(self, n_ops=N_OPS):
         super().__init__()
-        self.W_up = nn.Parameter(torch.eye(n_ops) + torch.randn(n_ops, n_ops) * 0.02)
-        self.W_dn = nn.Parameter(torch.eye(n_ops) + torch.randn(n_ops, n_ops) * 0.02)
+        self.W_up = nn.Parameter(torch.ones(n_ops, n_ops))
+        self.W_dn = nn.Parameter(torch.ones(n_ops, n_ops))
 
     def forward(self, F):
         B, n_ops, d, H, W = F.shape
@@ -55,9 +55,13 @@ class PhysicalPipeline(nn.Module):
         })
         # Coord: no projection, keep raw 2 channels
         self.fusion = BilinearFusion(n_ops=n_ops)
-        # Init: random orthogonal-ish (break identity, encourage diversity)
-        for proj in self.projections.values():
-            nn.init.orthogonal_(proj.weight, gain=0.5)
+        # Init: 恒等映射（第1维=保留原值，其余=0.1低噪，保留交叉交互）
+        for i, proj in enumerate(self.projections.values()):
+            w = torch.zeros(n_ops, 1, 1, 1)
+            w[0] = 1.0  # 第1通道=原值
+            for j in range(1, n_ops):
+                w[j] = 0.1  # 其余通道=弱信号（保持多样）
+            proj.weight.data = w
 
     def _coord_channels(self, B, H, W, device):
         yy = torch.linspace(-1, 1, H, device=device).view(1, 1, H, 1).expand(B, 1, H, W)
@@ -65,7 +69,11 @@ class PhysicalPipeline(nn.Module):
         return torch.cat([yy, xx], dim=1)  # [B, 2, H, W]
 
     def forward(self, x):
-        base = self.operator_layer(x)  # [B, 5, H, W]
+        base = self.operator_layer(x)  # [B, 9, H, W]
+        base = base[:, :self.n_ops, :, :]  # [B, 8, H, W] (去掉 void_prob)
+
+        # 实例归一化：每个算子零均值单位方差，消除恒等偏移
+        base = torch.nn.functional.instance_norm(base)
 
         # Project each physical operator: 1 → n_ops
         multi = []
@@ -73,7 +81,7 @@ class PhysicalPipeline(nn.Module):
             ch = base[:, i:i+1, :, :]
             feat = self.projections[f'op{i}'](ch)
             multi.append(feat)
-        F = torch.stack(multi, dim=1)  # [B, 5, 5, H, W]
+        F = torch.stack(multi, dim=1)  # [B, 8, 8, H, W]
 
         # Bilinear fusion: 5×5 = 25 dim
         field = self.fusion(F)  # [B, 25, H, W]
