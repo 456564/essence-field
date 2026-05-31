@@ -6,7 +6,7 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 import torch, numpy as np, cv2, argparse
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
-from src.operators import dong, gang, cu, ju
+from src.operators import dong, gang, cu, rou, ju, dist, yang, yin
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 OUT = Path(__file__).resolve().parent.parent.parent / 'test_output'
@@ -95,11 +95,11 @@ def test_op(op_fn, op_name):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('op', nargs='?', choices=['dong','gang','cu','ju','all'],
+    parser.add_argument('op', nargs='?', choices=['dong','gang','cu','rou','ju','dist','yang','yin','all'],
                         default='all', help='Operator to test')
     args = parser.parse_args()
 
-    ops = {'dong': dong, 'gang': gang, 'cu': cu, 'ju': ju}
+    ops = {'dong': dong, 'gang': gang, 'cu': cu, 'rou': rou, 'ju': ju, 'dist': dist, 'yang': yang, 'yin': yin}
     if args.op == 'all':
         for name, fn in ops.items():
             test_op(fn, name)

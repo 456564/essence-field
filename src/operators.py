@@ -1,154 +1,205 @@
 """
-物理算子 — 4个独立可测物理量
+物理算子 — 8 算子（四对互补）
 
-依赖链：
-  RGB → dong(梯度幅值) ─→ gang(梯度脊线)
-       ├→ cu(粗糙度)
-       └→ ju(围合度, 读gang)
-
-设计约束：
-  - 每个算子测一种客观物理量，不存在"X 的补集"
-  - 非负输出 [B, 1, H, W]
-  - 下层不依赖上层
+  dong(梯度) ─→ jing(1-dong)
+  gang(脊线) ─→ rou(渗透)
+  ju(围合)  ─→ san(1-ju)
+  yang(实体) ─→ yin(1-yang)
+  + cu(纹理) + dist(到边距离)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
-
-# ═══════════════════════════════════════════════════════════════
-# 工具
-# ═══════════════════════════════════════════════════════════════
 
 def _box_filter(x, k=5):
-    """Box 均值滤波，replicate 填充。支持任意通道数。"""
     C = x.shape[1]
-    w = torch.ones(1, 1, k, k, device=x.device) / (k * k)
+    w = torch.ones(1, 1, k, k, device=x.device, dtype=x.dtype) / (k * k)
     p = k // 2
     x_pad = F.pad(x, (p, p, p, p), mode='replicate')
     return F.conv2d(x_pad, w.repeat(C, 1, 1, 1), padding=0, groups=C)
 
 
 def _sobel_magnitude(x):
-    """Sobel 梯度幅值，三通道 L2 范数 → [B,1,H,W]"""
     device = x.device
-    kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
-                       device=device).view(1, 1, 3, 3)
-    ky = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]],
-                       device=device).view(1, 1, 3, 3)
+    kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device).view(1, 1, 3, 3)
     x_pad = F.pad(x, (1, 1, 1, 1), mode='replicate')
     gx = F.conv2d(x_pad, kx.repeat(3, 1, 1, 1), padding=0, groups=3)
     gy = F.conv2d(x_pad, ky.repeat(3, 1, 1, 1), padding=0, groups=3)
-    mag = torch.sqrt(gx ** 2 + gy ** 2)  # [B,3,H,W]
-    return torch.norm(mag, dim=1, keepdim=True)  # [B,1,H,W]
+    return torch.norm(torch.sqrt(gx ** 2 + gy ** 2), dim=1, keepdim=True)
 
 
-_MAX_SOBEL = 5.0  # 实用最大 Sobel 响应（box 抹平后）
+_MAX_SOBEL = 5.0
 
 
-# ═══════════════════════════════════════════════════════════════
-# 算子 1: 动 — 梯度幅值 (L0, RGB直接可测)
-# ═══════════════════════════════════════════════════════════════
-
+# ── 动 ──
 def dong(x):
-    """
-    动 — 梯度幅值（变化强度）
-    RGB → Sobel → box去噪 → /4.0归一化
-    输入 [B,3,H,W] → 输出 [B,1,H,W]，[0,1]
-    """
     mag = _sobel_magnitude(x)
     mag = _box_filter(mag, k=3)
     return torch.clamp(mag / _MAX_SOBEL, 0.0, 1.0)
 
 
-# ═══════════════════════════════════════════════════════════════
-# 算子 2: 刚 — 梯度脊线 (L1, 从动)
-# ═══════════════════════════════════════════════════════════════
+def _jing_from_dong(d):
+    return 1.0 - d
 
+
+# ── 刚 ──
 def _gang_from_dong(d):
-    """刚 = (dong - box(dong,7)).clamp(min=0)"""
-    return (d - _box_filter(d, k=7)).clamp(min=0)
+    ridges = []
+    for k in [3, 7, 15]:
+        ridges.append((d - _box_filter(d, k=k)).clamp(min=0))
+    ridge = torch.stack(ridges, dim=0).max(dim=0)[0]
+    # Gray supplement
+    return ridge
+
+
+def _gang_enhanced(x):
+    d = dong(x)
+    ridge_color = _gang_from_dong(d)
+    gray = x.mean(dim=1, keepdim=True)
+    gray_dong = torch.clamp(_box_filter(_sobel_magnitude(gray.repeat(1,3,1,1)), k=3) / _MAX_SOBEL, 0.0, 1.0)
+    ridge_gray = _gang_from_dong(gray_dong)
+    return torch.max(ridge_color, ridge_gray * 0.5)
 
 
 def gang(x):
-    """刚 — 梯度脊线（硬边界）。RGB兼容封装。"""
-    return _gang_from_dong(dong(x))
+    return _gang_enhanced(x)
 
 
-# ═══════════════════════════════════════════════════════════════
-# 算子 3: 粗 — 局部纹理能量 (L0, RGB直接可测)
-# ═══════════════════════════════════════════════════════════════
+# ── 粗 ──
+def _cu_from_rgb_dong(x, dong_map):
+    local_mean = _box_filter(x, k=5)
+    residual_sq = (x - local_mean) ** 2
+    ew = (1.0 - dong_map).clamp(min=1e-6)
+    variance = _box_filter(residual_sq * ew, k=7) / (_box_filter(ew, k=7) + 1e-8)
+    return torch.clamp(variance.mean(dim=1, keepdim=True) / 0.04, 0.0, 1.0)
+
 
 def cu(x):
-    """
-    粗 — 局部 RGB 方差（表面粗糙度）
-
-    物理量：邻域内像素 RGB 的均方偏差。
-    平滑表面 ≈ 0，粗糙纹理 > 0。
-    独立于梯度——边缘处梯度高但纹理可能低。
-
-    cu = box((x - box(x,5))², k=7).mean(channel)
-
-    输入 [B,3,H,W] → 输出 [B,1,H,W]
-    """
-    local_mean = _box_filter(x, k=5)         # [B,3,H,W] 邻域均值
-    residual_sq = (x - local_mean) ** 2       # [B,3,H,W] 偏差平方
-    variance = _box_filter(residual_sq, k=7)  # [B,3,H,W] 局部方差
-    cu_raw = variance.mean(dim=1, keepdim=True)  # [B,1,H,W] 三通道均值
-    return torch.clamp(cu_raw / 0.08, 0.0, 1.0)  # /0.08: 理论max≈0.25, 实用≈0.08
+    return _cu_from_rgb_dong(x, dong(x))
 
 
-# ═══════════════════════════════════════════════════════════════
-# 算子 4: 聚 — 围合度 (L1, 从刚)
-# ═══════════════════════════════════════════════════════════════
+# ── 柔 ──
+def _rou_from_dong_gang_cu(d, g, c):
+    rou_edge = (d - g).clamp(min=0)
+    rou_smooth = (1.0 - c).clamp(min=0)
+    return d * rou_edge + (1.0 - d) * rou_smooth
 
-def _ju_from_gang(g):
-    """
-    聚 — 被硬边界包围的程度
 
-    物理量：该像素周围 31×31 窗口内刚的密度。
-    闭合轮廓内密度高，开放侧密度低。
+def rou(x):
+    d = dong(x); g = _gang_from_dong(d); c = _cu_from_rgb_dong(x, d)
+    return _rou_from_dong_gang_cu(d, g, c)
 
-    ju = box_filter(gang, k=31) / 0.1
-    """
-    density = _box_filter(g, k=31)
-    return torch.clamp(density / 0.05, 0.0, 1.0)
+
+# ── 聚 ──
+def _ju_from_gang_dist(g, dist_map):
+    """ju = base_coverage × interior_score (no density — gang=0 inside kills interior)"""
+    _, _, H, W = g.shape
+    thresh = 0.01
+    best = torch.zeros_like(g)
+    for R in [max(H,W)//8, max(H,W)//5, max(H,W)//3]:
+        R = max(R, 15)
+        if R > max(H, W)//2: continue
+        g_pad = F.pad(g, (R, R, R, R), mode='replicate')
+        ml = F.max_pool2d(g_pad, (1, R), stride=1)[:, :, R:R+H, R:R+W]
+        gfx = torch.flip(g_pad, [3])
+        mr = torch.flip(F.max_pool2d(gfx, (1, R), stride=1)[:, :, R:R+H, R:R+W], [3])
+        mu = F.max_pool2d(g_pad, (R, 1), stride=1)[:, :, R:R+H, R:R+W]
+        gfy = torch.flip(g_pad, [2])
+        md = torch.flip(F.max_pool2d(gfy, (R, 1), stride=1)[:, :, R:R+H, R:R+W], [2])
+        # Opposite-direction pair: need matching edges, not random fragments
+        h_pair = ((ml > thresh).float() * (mr > thresh).float())
+        v_pair = ((mu > thresh).float() * (md > thresh).float())
+        covered = (h_pair + v_pair) / 2.0
+        best = torch.max(best, covered)
+    base_ju = best.clamp(0.0, 1.0)
+    # interior_score: absolute distance threshold (not relative)
+    interior_score = torch.sigmoid((dist_map - 0.08) * 30.0)  # 边界→0, 内部→1
+    # texture penalty: gang fragments → not enclosure
+    gang_density = _box_filter(g, k=7)
+    texture_penalty = (1.0 - gang_density * 10.0).clamp(0.0, 1.0)
+    return (base_ju * interior_score * texture_penalty).clamp(0.0, 1.0)
 
 
 def ju(x):
-    """聚 — 围合度。RGB 兼容封装。"""
-    return _ju_from_gang(_gang_from_dong(dong(x)))
+    d = dong(x); g = _gang_from_dong(d); t = _dist_from_gang(g)
+    return _ju_from_gang_dist(g, t)
 
 
-# ═══════════════════════════════════════════════════════════════
-# 注册表
-# ═══════════════════════════════════════════════════════════════
+def san(x):
+    return 1.0 - ju(x)
 
+
+# ── 距 ──
+def _dist_from_gang(g):
+    import cv2
+    B, _, H, W = g.shape
+    max_dist = np.sqrt(H**2 + W**2)
+    dist_batch = []
+    for b in range(B):
+        edge = (g[b, 0] > 0.01).cpu().numpy().astype(np.uint8)
+        dt = cv2.distanceTransform(1 - edge, cv2.DIST_L2, 5)
+        dt = np.clip(dt / (max_dist * 0.3), 0.0, 1.0)
+        dist_batch.append(torch.from_numpy(dt.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(g.device))
+    return torch.cat(dist_batch, dim=0)
+
+
+def dist(x):
+    return _dist_from_gang(_gang_from_dong(dong(x)))
+
+
+# ── 阳 ──
+def _yang_from_dong_gang_cu_ju(d, g, c, ju_val):
+    """
+    yang = ju × (1-dong) × (1-gang) × (1-cu)
+
+    ju: 围合门控 — 必须有围合才有实体（斑马 j=0 → y=0）
+    (1-dong): 非边缘 — 实体在变化带内侧
+    (1-gang): 非边界线 — gang 高 = 几何不连续
+    (1-cu): 非粗糙纹理 — 草地/毛发 cu 高 → 不是光滑实体表面
+    """
+    yang_raw = ju_val * (1.0 - d) * (1.0 - g.clamp(0.0, 1.0)) * (1.0 - c)
+    # Gaussian smooth
+    sigma = 3.0; ksize = int(sigma * 3) | 1; half = (ksize - 1) // 2
+    gauss_k = torch.exp(-torch.arange(-half, half+1, device=d.device, dtype=d.dtype)**2 / (2*sigma**2))
+    gauss_k = gauss_k / gauss_k.sum()
+    gk = (gauss_k.view(1, 1, 1, -1) * gauss_k.view(1, 1, -1, 1)).repeat(1, 1, 1, 1)
+    p = ksize // 2
+    y_pad = F.pad(yang_raw, (p,p,p,p), mode='replicate')
+    return F.conv2d(y_pad, gk, padding=0).clamp(0.0, 1.0)
+
+
+def yang(x):
+    d = dong(x); g = _gang_from_dong(d); c = _cu_from_rgb_dong(x, d)
+    ju_val = _ju_from_gang_dist(g, _dist_from_gang(g))
+    return _yang_from_dong_gang_cu_ju(d, g, c, ju_val)
+
+
+# ── 阴 ──
+def yin(x):
+    return 1.0 - yang(x)
+
+
+# ── 注册表 ──
 PHYSICAL_OPERATORS = {
-    'dong': dong,  # 动=梯度幅值 (L0)
-    'gang': gang,  # 刚=梯度脊线 (L1←动)
-    'cu':   cu,    # 粗=纹理能量 (L0)
-    'ju':   ju,    # 聚=围合度   (L1←刚)
+    'dong': dong, 'gang': gang, 'cu': cu, 'rou': rou,
+    'ju': ju, 'dist': dist, 'yang': yang, 'yin': yin,
 }
+N_OPS = 8
 
 
-# ═══════════════════════════════════════════════════════════════
-# 算子层
-# ═══════════════════════════════════════════════════════════════
-
+# ── 算子层 ──
 class PhysicalOperatorLayer(nn.Module):
-    """
-    4 物理算子层 — 按依赖链编排
-
-    RGB → dong ─→ gang ─→ ju
-         └→ cu
-    """
-
     def forward(self, x):
-        d = dong(x)                    # L0
-        g = _gang_from_dong(d)         # L1
-        c = cu(x)                      # L0 (独立)
-        j = _ju_from_gang(g)           # L1
-
-        return torch.cat([d, g, c, j], dim=1)  # [B,4,H,W]
+        d = dong(x)
+        g = _gang_from_dong(d)
+        c = _cu_from_rgb_dong(x, d)
+        r = _rou_from_dong_gang_cu(d, g, c)
+        t = _dist_from_gang(g)
+        ju_v = _ju_from_gang_dist(g, t)
+        yg = _yang_from_dong_gang_cu_ju(d, g, c, ju_v)
+        yn = 1.0 - yg
+        return torch.cat([d, g, c, r, ju_v, t, yg, yn], dim=1)
