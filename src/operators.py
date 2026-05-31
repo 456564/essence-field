@@ -206,15 +206,110 @@ def void_prob(x):
     return _void_prob(ju_v, c, jing_v, yg, g)
 
 
+# ═══════════════════════════════════════════════════
+# 局部空间统计算子（纯数学，无参数）
+# ═══════════════════════════════════════════════════
+
+def ju_var(ju_map):
+    """
+    围合局部均匀度 — 7×7窗口内 ju 的变异系数倒数为均匀度
+    低值→均匀围合核心(空腔中心); 高值→围合边界/碎片
+    """
+    mean = _box_filter(ju_map, k=7)
+    sq_mean = _box_filter(ju_map ** 2, k=7)
+    var = (sq_mean - mean ** 2).clamp(min=0)
+    cv = torch.sqrt(var) / (mean + 1e-6)
+    # cv高→不均匀(边界/碎片) → 输出高
+    return 1.0 - torch.exp(-cv * 3.0)
+
+
+def dist_curv(dist_map):
+    """
+    围合边界曲率 — dist场 Hessian 最大特征值
+    高值→凸包围(容器内部); 低值→凹/平边界(外部)
+    """
+    # Sobel 二阶导
+    sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
+                         dtype=dist_map.dtype, device=dist_map.device)
+    # dxx = dx(dx)
+    dx = F.conv2d(dist_map, sobel, padding=1)
+    dxx = F.conv2d(dx, sobel, padding=1)
+    # dyy = dy(dy)
+    dy = F.conv2d(dist_map, sobel.transpose(2, 3), padding=1)
+    dyy = F.conv2d(dy, sobel.transpose(2, 3), padding=1)
+    # dxy = dx(dy)
+    dxy = F.conv2d(dy, sobel, padding=1)
+    # Hessian 最大特征值: λ_max = (dxx+dyy + sqrt((dxx-dyy)² + 4dxy²)) / 2
+    disc = torch.sqrt((dxx - dyy) ** 2 + 4.0 * dxy ** 2 + 1e-6)
+    lambda_max = (dxx + dyy + disc) / 2.0
+    # sigmoid 归一化到 [0,1]; λ_max>0.1 → 高曲率
+    return torch.sigmoid(lambda_max / 0.1)
+
+
+def gang_conn(gang_map):
+    """
+    刚边界连续性 — 在9×9窗口内检测相邻gang像素是否构成连续线段
+    高值→连续轮廓(一个环); 低值→纹理碎片/杂乱边界
+    """
+    g = (gang_map > 0.3).float()
+    # 3×3 邻域内 gang 邻居计数（含自身）
+    kernel = g.new_ones(1, 1, 3, 3)
+    n = F.conv2d(g, kernel, padding=1)
+    # 连续线段像素有 ≥3 个邻居（自身+2个沿边方向邻居）
+    continuous = (n >= 3).float()
+    # 9×9 模糊 → 局部连续性密度
+    return _box_filter(continuous, k=9)
+
+
+def tex_aniso(x, dong_map):
+    """
+    纹理各向异性 — 梯度方向直方图的熵取反
+    高值→有主导方向(木纹/毛发); 低值→各向同性(草地/噪点)
+    """
+    # 梯度方向
+    sobel = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
+                         dtype=x.dtype, device=x.device)
+    gx = F.conv2d(x.mean(dim=1, keepdim=True), sobel, padding=1)
+    gy = F.conv2d(x.mean(dim=1, keepdim=True), sobel.transpose(2, 3), padding=1)
+    angle = torch.atan2(gy, gx)  # [-π, π]
+    # 只在高梯度区域(>0.1)计算方向，平坦区不参与
+    mask = (dong_map > 0.1).float()
+    # 8 方向直方图 (0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°)
+    bins = 8
+    bin_size = 2 * np.pi / bins
+    angle_norm = (angle + np.pi) / bin_size  # [0, 16)
+    # 用高斯权重把每个像素分配到相邻两个bin
+    weights = []
+    for b in range(bins):
+        center = (b + 0.5) * bin_size
+        w = torch.exp(-((angle_norm - center) ** 2) * 2.0)
+        w = w * mask
+        weights.append(_box_filter(w, k=7))
+    hist = torch.stack(weights, dim=1)  # [B, 8, H, W]
+    # 归一化到概率
+    hist = hist / (hist.sum(dim=1, keepdim=True) + 1e-6)
+    # 熵 = -sum(p * log(p+ε))
+    entropy = -(hist * torch.log(hist + 1e-6)).sum(dim=1, keepdim=True)
+    max_entropy = np.log(bins)
+    # 各向异性 = 1 - 熵归一化：高熵(均匀分布)→0(各向同性), 低熵(主导方向)→1(各向异性)
+    result = (1.0 - entropy / max_entropy).clamp(0.0, 1.0)
+    # 确保4D [B, 1, H, W]
+    while result.dim() > 4:
+        result = result.squeeze(1)
+    return result
+
+
 # ── 注册表 ──
 PHYSICAL_OPERATORS = {
     'dong': dong, 'gang': gang, 'cu': cu, 'rou': rou,
     'ju': ju, 'dist': dist, 'yang': yang, 'yin': yin,
+    'ju_var': ju_var, 'dist_curv': dist_curv,
+    'gang_conn': gang_conn, 'tex_aniso': tex_aniso,
 }
-N_OPS = 8
+N_OPS = 12
 
 
-# ── 算子层 ──
+# ── 算子层（9基础 + 4局部统计 = 13 通道）───
 class PhysicalOperatorLayer(nn.Module):
     def forward(self, x):
         d = dong(x)
@@ -226,4 +321,14 @@ class PhysicalOperatorLayer(nn.Module):
         yg = _yang_from_dong_gang_cu_ju(d, g, c, ju_v)
         yn = 1.0 - yg
         vp = _void_prob(ju_v, c, _jing_from_dong(d), yg, g)
-        return torch.cat([d, g, c, r, ju_v, t, yg, yn, vp], dim=1)  # [B,9,H,W]
+        # 4个局部空间统计算子
+        jv = ju_var(ju_v)
+        dc = dist_curv(t)
+        gc = gang_conn(g)
+        ta = tex_aniso(x, d)
+        tensors = [d, g, c, r, ju_v, t, yg, yn, vp, jv, dc, gc, ta]
+        names = ['d','g','c','r','ju','t','yg','yn','vp','jv','dc','gc','ta']
+        for name, ten in zip(names, tensors):
+            if ten.dim() != 4:
+                raise RuntimeError(f"{name} has {ten.dim()}D -> {ten.shape}")
+        return torch.cat(tensors, dim=1)  # [B, 13, H, W]

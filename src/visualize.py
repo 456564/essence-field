@@ -32,25 +32,30 @@ def _per_op_spatial(base_9ch, op_idx):
 # 组件1：算子响应全景图（8个算子并列显示）
 # ═══════════════════════════════════════════════════
 
-def operator_panel(base_9ch, figsize=(18, 6)):
+def operator_panel(base_13ch, figsize=(20, 12)):
     """
-    8算子空间响应全景图 + void_prob
-    base_9ch: [B, 9, H, W] from PhysicalOperatorLayer
+    13算子空间响应全景图（8物理 + void_prob + 4局部统计）
+    base_13ch: [B, 13, H, W] from PhysicalOperatorLayer
     """
-    fig, axes = plt.subplots(2, 5, figsize=figsize)
-    for i in range(8):
+    labels = ['dong(梯度)', 'gang(边界)', 'cu(纹理)', 'rou(渐变)',
+              'ju(围合)', 'dist(距边)', 'yang(实体)', 'yin(虚空)',
+              'void_prob', 'ju_var(围合均匀)', 'dist_curv(曲率)',
+              'gang_conn(连通)', 'tex_aniso(各向异性)']
+    fig, axes = plt.subplots(3, 5, figsize=figsize)
+    for i in range(13):
         r, c = divmod(i, 5)
-        spat = _per_op_spatial(base_9ch, i)
+        spat = _per_op_spatial(base_13ch, i)
         ax = axes[r, c]
-        vmin, vmax = np.percentile(spat, 2), np.percentile(spat, 98)
-        ax.imshow(spat, cmap='viridis', vmin=vmin, vmax=vmax)
-        ax.set_title(OP_LABELS[i], fontsize=9)
+        if i == 8:
+            ax.imshow(spat, cmap='plasma', vmin=0, vmax=1)
+        else:
+            vmin, vmax = np.percentile(spat, 2), np.percentile(spat, 98)
+            ax.imshow(spat, cmap='viridis', vmin=vmin, vmax=vmax)
+        ax.set_title(f"{labels[i]}  {spat.mean():.3f}", fontsize=8)
         ax.axis('off')
-    # 第9通道 = void_prob
-    vp = _per_op_spatial(base_9ch, 8)
-    axes[1, 4].imshow(vp, cmap='plasma', vmin=0, vmax=1)
-    axes[1, 4].set_title("void_prob(虚空)", fontsize=9)
-    axes[1, 4].axis('off')
+    for i in range(13, 15):
+        r, c = divmod(i, 5)
+        axes[r, c].axis('off')
     plt.tight_layout()
     return fig
 
@@ -87,9 +92,9 @@ def all_operator_overlays(base_9ch, img_orig):
 # 组件3：原图 + 本质场范数
 # ═══════════════════════════════════════════════════
 
-def field_norm_map(field_66, img_orig, ax=None):
-    """本质场66维L2范数热力图"""
-    norms = field_66[0].norm(dim=0).cpu().numpy()
+def field_norm_map(field_71, img_orig, ax=None):
+    """本质场L2范数热力图"""
+    norms = field_71[0].norm(dim=0).cpu().numpy()
     if ax is None:
         _, ax = plt.subplots(figsize=(5, 5))
     vmin, vmax = np.percentile(norms, 2), np.percentile(norms, 98)
@@ -99,33 +104,54 @@ def field_norm_map(field_66, img_orig, ax=None):
     return ax
 
 
-def essence_panel(field_66, base_9ch, img_orig):
+def essence_panel(field_71, base_13ch, img_orig):
     """
-    完整面板：原图 + 范数 + 8算子叠加 + void_prob
+    完整面板：原图 + 范数 + 13算子叠加 + 辅助通道
     """
-    fig = plt.figure(figsize=(18, 12))
-    # 原图
-    ax = fig.add_axes([0.02, 0.7, 0.15, 0.25])
+    op_labels = ['dong', 'gang', 'cu', 'rou', 'ju', 'dist', 'yang', 'yin',
+                 'void_prob', 'ju_var', 'dist_curv', 'gang_conn', 'tex_aniso']
+    fig = plt.figure(figsize=(22, 16))
     img = img_orig / 255.0 if img_orig.max() > 1 else img_orig
+
+    # 原图
+    ax = fig.add_axes([0.01, 0.72, 0.12, 0.25])
     ax.imshow(img)
-    ax.set_title("原图"); ax.axis('off')
+    ax.set_title("原图", fontsize=10); ax.axis('off')
+
     # 范数
-    ax = fig.add_axes([0.20, 0.7, 0.15, 0.25])
-    field_norm_map(field_66, img_orig, ax=ax)
-    # 8算子叠加
-    for i in range(8):
-        r, c = i // 4, i % 4
-        left, bottom = 0.02 + c * 0.24, 0.05 + (1 - r) * 0.30
-        ax = fig.add_axes([left, bottom, 0.22, 0.27])
-        ov = overlay_op(base_9ch, i, img_orig)
-        ax.imshow(ov)
-        ax.set_title(OP_LABELS[i], fontsize=8)
-        ax.axis('off')
-    # 第9通道 void_prob
-    ax = fig.add_axes([0.74, 0.7, 0.22, 0.27])
-    vp = _per_op_spatial(base_9ch, 8)
+    ax = fig.add_axes([0.15, 0.72, 0.12, 0.25])
+    field_norm_map(field_71, img_orig, ax=ax)
+
+    # void_prob
+    ax = fig.add_axes([0.29, 0.72, 0.12, 0.25])
+    vp = _per_op_spatial(base_13ch, 8)
     ax.imshow(vp, cmap='plasma', vmin=0, vmax=1)
     ax.set_title("void_prob(虚空)", fontsize=9)
+    ax.axis('off')
+
+    # 13算子叠加（3行×5列，取13个）
+    for i in range(13):
+        r, c = i // 5, i % 5
+        left = 0.44 + c * 0.11
+        bottom = 0.37 + (2 - r) * 0.18
+        ax = fig.add_axes([left, bottom, 0.10, 0.16])
+        if i == 8:
+            v = _per_op_spatial(base_13ch, i)
+            ax.imshow(v, cmap='plasma', vmin=0, vmax=1)
+        else:
+            ov = overlay_op(base_13ch, i, img_orig)
+            ax.imshow(ov)
+        ax.set_title(op_labels[i], fontsize=6)
+        ax.axis('off')
+
+    # 数值总结
+    norms = field_71[0].norm(dim=0).cpu().numpy()
+    median = np.median(norms)
+    sep = (norms[norms>median].mean() - norms[norms<=median].mean()) / (norms[norms<=median].mean() + 1e-6)
+    ax = fig.add_axes([0.01, 0.02, 0.95, 0.12])
+    ax.text(0.5, 0.5, f"分离度: {sep:.1f}  本质场: 71维 (64融合+5辅助+2坐标)",
+            ha='center', va='center', fontsize=14,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     ax.axis('off')
     return fig
 
@@ -281,14 +307,15 @@ if __name__ == "__main__":
     pipe = PhysicalPipeline().to(device).eval()
     img = cv2.imread("test_maccup.png")
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    x = torch.from_numpy(cv2.resize(img_rgb, (224,224))).permute(2,0,1).float().unsqueeze(0).to(device) / 255.0
+    img_resized = cv2.resize(img_rgb, (224, 224))
+    x = torch.from_numpy(img_resized).permute(2,0,1).float().unsqueeze(0).to(device) / 255.0
     op_layer = PhysicalOperatorLayer()
 
     with torch.no_grad():
         base = op_layer(x)
         field = pipe(x)
 
-    essence_panel(field, base, cv2.resize(img_rgb, (224,224)))
+    essence_panel(field, base, img_resized)
     plt.savefig("test_output/essence_panel.png", dpi=150, bbox_inches='tight')
     plt.close()
     print("✅ test_output/essence_panel.png")
