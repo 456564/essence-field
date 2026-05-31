@@ -183,6 +183,26 @@ def yin(x):
     return 1.0 - yang(x)
 
 
+# ── 虚空概率 ──
+def _void_prob(ju_val, c, jing_val, yang_val, g):
+    """
+    void_prob = ju × (1-cu) × jing × (1-yang) × (gang<0.01)
+
+    围合内部 + 无纹理 + 静止 + 非实体表面 + 非边界线 = 高概率虚空(空腔)
+    动物毛发: cu 高 → (1-cu) 低 → void_prob 低 → 粒子不进入
+    杯腔: cu 低, jing 高, yang 低 → void_prob 高 → 粒子可进入
+    """
+    return (ju_val * (1.0 - c) * jing_val * (1.0 - yang_val) * (g < 0.01).float()).clamp(0.0, 1.0)
+
+
+def void_prob(x):
+    d = dong(x); g = _gang_from_dong(d); c = _cu_from_rgb_dong(x, d)
+    t = _dist_from_gang(g); ju_v = _ju_from_gang_dist(g, t)
+    yg = _yang_from_dong_gang_cu_ju(d, g, c, ju_v)
+    jing_v = _jing_from_dong(d)
+    return _void_prob(ju_v, c, jing_v, yg, g)
+
+
 # ── 注册表 ──
 PHYSICAL_OPERATORS = {
     'dong': dong, 'gang': gang, 'cu': cu, 'rou': rou,
@@ -202,4 +222,5 @@ class PhysicalOperatorLayer(nn.Module):
         ju_v = _ju_from_gang_dist(g, t)
         yg = _yang_from_dong_gang_cu_ju(d, g, c, ju_v)
         yn = 1.0 - yg
-        return torch.cat([d, g, c, r, ju_v, t, yg, yn], dim=1)
+        vp = _void_prob(ju_v, c, _jing_from_dong(d), yg, g)
+        return torch.cat([d, g, c, r, ju_v, t, yg, yn, vp], dim=1)  # [B,9,H,W]

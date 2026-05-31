@@ -27,17 +27,21 @@ class ParticleSimulator:
         H, W = wall.shape[-2:]
         device = wall.device
 
-        # Spawn in high-ju regions (potential cavities)
-        ju_np = ju[0, 0].cpu().numpy()
-        candidates = np.argwhere(ju_np > 0.3)  # (y, x) pairs
-        if len(candidates) < self.num_particles:
-            # Not enough ju pixels, pad with random positions
+        # Spawn in cavity regions (void_prob > 0.3)
+        cavity = essence_space.cavity_mask  # [1,1,H,W]
+        cavity_np = cavity[0, 0].cpu().numpy()
+        candidates = np.argwhere(cavity_np > 0.5)  # (y, x) pairs
+        if len(candidates) < 10:
+            # No cavities found — spawn randomly (particles will just bounce off walls)
+            rand_y = np.random.randint(H//4, 3*H//4, self.num_particles)
+            rand_x = np.random.randint(W//4, 3*W//4, self.num_particles)
+        elif len(candidates) < self.num_particles:
             rand_y = np.random.randint(0, H, self.num_particles)
             rand_x = np.random.randint(0, W, self.num_particles)
-            n_ju = min(len(candidates), self.num_particles)
-            chosen = np.random.choice(len(candidates), n_ju, replace=False)
-            rand_y[:n_ju] = candidates[chosen, 0]
-            rand_x[:n_ju] = candidates[chosen, 1]
+            n_cav = min(len(candidates), self.num_particles)
+            chosen = np.random.choice(len(candidates), n_cav, replace=False)
+            rand_y[:n_cav] = candidates[chosen, 0]
+            rand_x[:n_cav] = candidates[chosen, 1]
         else:
             chosen = np.random.choice(len(candidates), self.num_particles, replace=True)
             rand_y = candidates[chosen, 0]
@@ -102,17 +106,16 @@ class ParticleSimulator:
         frames.append((x.clone(), y.clone(), active.clone()))
         return x, y, active, frames
 
-    def compute_retention(self, x, y, active, essence_space, ju_thresh=0.3):
-        """滞留率：粒子停止后仍在高 ju 区的比例"""
-        ju_field = essence_space.get('ju')
-        H, W = ju_field.shape[-2], ju_field.shape[-1]
+    def compute_retention(self, x, y, active, essence_space):
+        """滞留率：停止后的粒子在 cavity 区的比例"""
+        cavity = essence_space.cavity_mask  # [1,1,H,W]
+        H, W = cavity.shape[-2], cavity.shape[-1]
         in_bounds = (y >= 0) & (y < H) & (x >= 0) & (x < W)
         x_l = x.long().clamp(0, W-1)
         y_l = y.long().clamp(0, H-1)
-        ju_vals = ju_field[0, 0, y_l, x_l]
+        in_cav = cavity[0, 0, y_l, x_l] > 0.5
         stopped = ~active
-        in_ju = ju_vals > ju_thresh
-        trapped = stopped & in_ju & in_bounds
+        trapped = stopped & in_cav & in_bounds
         if (~active).any():
             return trapped.float().mean().item(), trapped
         return 0.0, trapped

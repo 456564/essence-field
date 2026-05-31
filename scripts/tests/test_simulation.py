@@ -23,7 +23,7 @@ def run_sim(img_hwc, name, n_particles=300):
 
     sim = ParticleSimulator(num_particles=n_particles, max_steps=max(300, H))
     fx, fy, active, frames = sim.simulate(space)
-    retention, trapped = sim.compute_retention(fx, fy, active, space)
+    retention, trapped = sim.compute_retention(fx, fy, active, space)  # uses cavity_mask now
 
     print(f"  {name}: retention={retention:.4f}  ({trapped.sum()}/{n_particles} trapped)")
 

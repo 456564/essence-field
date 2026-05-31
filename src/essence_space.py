@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 
 
-CHANNEL_ORDER = ['yang', 'yin', 'dong', 'jing', 'gang', 'rou', 'ju', 'san']
+CHANNEL_ORDER = ['yang', 'yin', 'dong', 'jing', 'gang', 'rou', 'ju', 'san', 'void_prob']
 
 
 class EssenceSpace:
@@ -39,6 +39,11 @@ class EssenceSpace:
             self._wall_mask = self._build_wall()
         return self._wall_mask
 
+    @property
+    def cavity_mask(self):
+        """粒子可停留的虚空区域: void_prob > 0.3"""
+        return (self.get('void_prob') > 0.3).float()
+
     def _build_wall(self, gang_thresh=0.1, yang_thresh=0.3, dilate_k=5):
         from .operators import _box_filter
         gang = self.get('gang')
@@ -46,7 +51,9 @@ class EssenceSpace:
         wall_rigid = (gang > gang_thresh).float()
         wall_solid = (yang > yang_thresh).float()
         wall = torch.clamp(wall_rigid + wall_solid, 0, 1)
-        # 膨胀确保 1 像素缝隙也被阻挡
         wall = _box_filter(wall, k=dilate_k)
         wall = (wall > 0.01).float()
+        # Exclude cavity zone from wall — particles need to enter cavities
+        cavity = self.cavity_mask
+        wall = wall * (1.0 - cavity)
         return wall.detach()
