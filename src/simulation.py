@@ -106,6 +106,59 @@ class ParticleSimulator:
         frames.append((x.clone(), y.clone(), active.clone()))
         return x, y, active, frames
 
+    def step(self, x, y, active, essence_space):
+        """单步演化。返回 (new_x, new_y, new_active)"""
+        wall = essence_space.wall_mask  # [1, 1, H, W]
+        H, W = wall.shape[-2:]
+        device = wall.device
+        n = len(x)
+
+        if not active.any():
+            return x, y, active
+
+        # Random walk with gravity bias
+        moves_y = torch.randint(-1, 2, (n,), device=device).float()
+        moves_x = torch.randint(-1, 2, (n,), device=device).float()
+        grav = torch.rand(n, device=device) < 0.8
+        moves_y = torch.where(grav, torch.ones_like(moves_y), moves_y)
+
+        new_x = (x + moves_x).clamp(0, W-1).long()
+        new_y = (y + moves_y).clamp(0, H-1).long()
+
+        blocked = wall[0, 0, new_y, new_x] > 0.5
+        x = torch.where(~blocked & active, new_x.float(), x)
+        y = torch.where(~blocked & active, new_y.float(), y)
+
+        h_new_x = (x + moves_x.sign()).clamp(0, W-1).long()
+        h_blocked = wall[0, 0, y.long().clamp(0, H-1), h_new_x] > 0.5
+        x = torch.where(blocked & ~h_blocked & active, h_new_x.float(), x)
+
+        stuck = blocked & h_blocked & active
+        active = active & ~stuck
+
+        out = (y >= H-1) | (y <= 0) | (x <= 0) | (x >= W-1)
+        active = active & ~out
+
+        return x, y, active
+
+    def spawn(self, essence_space, n):
+        """在 cavity 区生成 n 个新粒子。返回 (x, y, active)"""
+        H, W = essence_space.wall_mask.shape[-2:]
+        device = essence_space.wall_mask.device
+        cavity = essence_space.cavity_mask[0, 0].cpu().numpy()
+        cand = np.argwhere(cavity > 0.5)
+        if len(cand) < 10:
+            ry = np.random.randint(0, H, n)
+            rx = np.random.randint(0, W, n)
+        else:
+            ch = np.random.choice(len(cand), n, replace=True)
+            ry = cand[ch, 0].astype(np.float32)
+            rx = cand[ch, 1].astype(np.float32)
+        x = torch.from_numpy(rx.astype(np.float32)).to(device)
+        y = torch.from_numpy(ry.astype(np.float32)).to(device)
+        active = torch.ones(n, dtype=torch.bool, device=device)
+        return x, y, active
+
     def compute_retention(self, x, y, active, essence_space):
         """滞留率：停止后的粒子在 cavity 区的比例"""
         cavity = essence_space.cavity_mask  # [1,1,H,W]
