@@ -1,139 +1,133 @@
 """
-卦象声纳 — 64维场可视化调试面板
+物理算子声纳 — 8物理算子可视化调试面板
 
-三个组件：
-  1. 活跃度矩阵 — 8×8 格栅，每格 = 一个子网络的全局强度
-  2. 主控强度地图 — 按卦选择，展示该卦在原图上的空间响应
-  3. 训练演化视图 — 周期性记录，绘制子网络活动随时间变化
+组件:
+  1. 活跃度矩阵 — 8×8 格栅
+  2. 强度地图 — 每个算子的空间响应
+  3. 原图+最强算子叠加
 """
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-# 64维 → 8算子映射（每个算子8个投影通道）
-GUA_NAMES = ['乾qian', '坤kun', '震zhen', '巽xun',
-             '坎kan', '离li', '艮gen', '兑dui']
-GUA_COLORS = ['#E74C3C', '#2ECC71', '#3498DB', '#F1C40F',
-              '#1ABC9C', '#E91E63', '#E67E22', '#9B59B6']
-GUA_SYMBOLS = ['乾', '坤', '震', '巽', '坎', '离', '艮', '兑']
+from .operators import dong, gang, cu, rou, ju, dist, yang, yin, void_prob
+
+OP_NAMES = ['dong', 'gang', 'cu', 'rou', 'ju', 'dist', 'yang', 'yin']
+OP_LABELS = ['动(梯度)', '刚(边界)', '粗(纹理)', '柔(渐变)',
+             '聚(围合)', '距(边距)', '阳(实体)', '阴(虚空)']
+OP_COLORS = ['#E74C3C', '#F39C12', '#3498DB', '#1ABC9C',
+             '#2ECC71', '#9B59B6', '#E91E63', '#34495E']
 
 
-def _per_gua_intensity(field_64):
-    """
-    field_64: [B, 64, H, W] → 每个卦的全局强度 [8]
-    64维中每8维对应一个算子
-    """
-    B, C, H, W = field_64.shape
-    intensity = []
-    for i in range(8):
-        block = field_64[:, i*8:(i+1)*8, :, :]      # [B, 8, H, W]
-        norm = block.norm(dim=1).mean()               # L2范数, 全局平均
-        intensity.append(norm.item())
-    return np.array(intensity)
-
-
-def _per_gua_spatial(field_64, gua_idx):
-    """
-    field_64: [B, 64, H, W] → 指定卦的空间强度图 [H, W]
-    """
-    block = field_64[0, gua_idx*8:(gua_idx+1)*8, :, :]  # [8, H, W]
-    return block.norm(dim=0).cpu().numpy()              # [H, W]
+def _per_op_spatial(base_9ch, op_idx):
+    """base_9ch: [B, 9, H, W] from PhysicalOperatorLayer → 指定算子的空间强度 [H,W]"""
+    return base_9ch[0, op_idx].cpu().numpy()
 
 
 # ═══════════════════════════════════════════════════
-# 组件1：活跃度矩阵 8×8
+# 组件1：算子响应全景图（8个算子并列显示）
 # ═══════════════════════════════════════════════════
 
-def sonar_matrix(field_64, ax=None, title="卦象声纳"):
+def operator_panel(base_9ch, figsize=(18, 6)):
     """
-    8×8 格栅：每行 = 一个卦，每列 = 该卦的一个投影通道
-    颜色深浅 = 该子网络的全局平均范数
+    8算子空间响应全景图 + void_prob
+    base_9ch: [B, 9, H, W] from PhysicalOperatorLayer
     """
-    B, C, H, W = field_64.shape
-    # 计算每个子网络的全局范数 → [8, 8]
-    matrix = np.zeros((8, 8))
+    fig, axes = plt.subplots(2, 5, figsize=figsize)
     for i in range(8):
-        for j in range(8):
-            ch = field_64[0, i*8 + j, :, :]
-            matrix[i, j] = ch.norm().item()
-
-    if ax is None:
-        _, ax = plt.subplots(figsize=(8, 7))
-
-    im = ax.imshow(matrix, cmap='YlOrRd', aspect='equal')
-    ax.set_xticks(range(8))
-    ax.set_yticks(range(8))
-    ax.set_ylabel("算子（卦）")
-    ax.set_xlabel("投影通道")
-
-    # 卦名 + 符号
-    row_max = matrix.mean(axis=1)
-    for i in range(8):
-        ax.text(-1.5, i, f"{GUA_SYMBOLS[i]} {GUA_NAMES[i]}", ha='right', va='center',
-                fontsize=9, color='black',
-                fontweight='bold' if row_max[i] > row_max.mean() else 'normal')
-
-    # 数值
-    for i in range(8):
-        for j in range(8):
-            ax.text(j, i, f"{matrix[i,j]:.1f}", ha='center', va='center',
-                    fontsize=7, color='white' if matrix[i,j] > matrix.mean() else 'black')
-
-    ax.set_title(title)
-    plt.colorbar(im, ax=ax, shrink=0.8, label='子网络范数')
-    return matrix
-
-
-# ═══════════════════════════════════════════════════
-# 组件2：主控强度地图（单卦空间分布）
-# ═══════════════════════════════════════════════════
-
-def activation_map(field_64, gua_idx, ax=None, title=None, cmap='hot'):
-    """
-    指定卦的空间强度热力图
-    """
-    spat = _per_gua_spatial(field_64, gua_idx)
-
-    if ax is None:
-        _, ax = plt.subplots(figsize=(4, 4))
-
-    vmin, vmax = np.percentile(spat, 5), np.percentile(spat, 98)
-    ax.imshow(spat, cmap=cmap, vmin=vmin, vmax=vmax)
-    ax.set_title(title or f"{GUA_SYMBOLS[gua_idx]} {GUA_NAMES[gua_idx]}")
-    ax.axis('off')
-
-
-def eight_gua_maps(field_64, figsize=(16, 8)):
-    """8 卦空间强度全景图"""
-    fig, axes = plt.subplots(2, 4, figsize=figsize)
-    for i, ax in enumerate(axes.flat):
-        activation_map(field_64, i, ax=ax,
-                       title=f"{GUA_SYMBOLS[i]} {GUA_NAMES[i]} ({GUA_NAMES[i][:2]})")
+        r, c = divmod(i, 5)
+        spat = _per_op_spatial(base_9ch, i)
+        ax = axes[r, c]
+        vmin, vmax = np.percentile(spat, 2), np.percentile(spat, 98)
+        ax.imshow(spat, cmap='viridis', vmin=vmin, vmax=vmax)
+        ax.set_title(OP_LABELS[i], fontsize=9)
+        ax.axis('off')
+    # 第9通道 = void_prob
+    vp = _per_op_spatial(base_9ch, 8)
+    axes[1, 4].imshow(vp, cmap='plasma', vmin=0, vmax=1)
+    axes[1, 4].set_title("void_prob(虚空)", fontsize=9)
+    axes[1, 4].axis('off')
     plt.tight_layout()
     return fig
 
 
 # ═══════════════════════════════════════════════════
-# 组件3：训练演化视图
+# 组件2：单算子-原图叠加
 # ═══════════════════════════════════════════════════
 
-class TrainingLogger:
-    """在训练循环中周期性记录子网络强度"""
-    def __init__(self):
-        self.steps = []
-        self.per_gua = {name: [] for name in GUA_NAMES}
+def overlay_op(base_9ch, op_idx, img_orig, alpha=0.5):
+    """单个算子热力图叠加在原图上"""
+    spat = _per_op_spatial(base_9ch, op_idx)
+    img = img_orig / 255.0 if img_orig.max() > 1 else img_orig.copy()
+    color = np.array(plt.cm.colors.hex2color(OP_COLORS[op_idx]))  # [3]
+    vmin, vmax = np.percentile(spat, 2), np.percentile(spat, 98)
+    normed = np.clip((spat - vmin) / (vmax - vmin + 1e-8), 0, 1)
+    heat = normed[..., np.newaxis] * color[np.newaxis, np.newaxis, :]
+    blended = img * (1 - alpha) + heat * alpha
+    return (np.clip(blended, 0, 1) * 255).astype(np.uint8)
 
-    def log(self, step, field_64):
-        """field_64: [B, 64, H, W]"""
-        intensity = _per_gua_intensity(field_64)
-        self.steps.append(step)
-        for i, name in enumerate(GUA_NAMES):
-            self.per_gua[name].append(intensity[i])
+
+def all_operator_overlays(base_9ch, img_orig):
+    """8算子各自叠加在原图上，拼成一张图"""
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    for i, ax in enumerate(axes.flat):
+        ov = overlay_op(base_9ch, i, img_orig)
+        ax.imshow(ov)
+        ax.set_title(OP_LABELS[i], fontsize=9)
+        ax.axis('off')
+    plt.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════
+# 组件3：原图 + 本质场范数
+# ═══════════════════════════════════════════════════
+
+def field_norm_map(field_66, img_orig, ax=None):
+    """本质场66维L2范数热力图"""
+    norms = field_66[0].norm(dim=0).cpu().numpy()
+    if ax is None:
+        _, ax = plt.subplots(figsize=(5, 5))
+    vmin, vmax = np.percentile(norms, 2), np.percentile(norms, 98)
+    ax.imshow(norms, cmap='hot', vmin=vmin, vmax=vmax)
+    ax.set_title("本质场范数")
+    ax.axis('off')
+    return ax
+
+
+def essence_panel(field_66, base_9ch, img_orig):
+    """
+    完整面板：原图 + 范数 + 8算子叠加 + void_prob
+    """
+    fig = plt.figure(figsize=(18, 12))
+    # 原图
+    ax = fig.add_axes([0.02, 0.7, 0.15, 0.25])
+    img = img_orig / 255.0 if img_orig.max() > 1 else img_orig
+    ax.imshow(img)
+    ax.set_title("原图"); ax.axis('off')
+    # 范数
+    ax = fig.add_axes([0.20, 0.7, 0.15, 0.25])
+    field_norm_map(field_66, img_orig, ax=ax)
+    # 8算子叠加
+    for i in range(8):
+        r, c = i // 4, i % 4
+        left, bottom = 0.02 + c * 0.24, 0.05 + (1 - r) * 0.30
+        ax = fig.add_axes([left, bottom, 0.22, 0.27])
+        ov = overlay_op(base_9ch, i, img_orig)
+        ax.imshow(ov)
+        ax.set_title(OP_LABELS[i], fontsize=8)
+        ax.axis('off')
+    # 第9通道 void_prob
+    ax = fig.add_axes([0.74, 0.7, 0.22, 0.27])
+    vp = _per_op_spatial(base_9ch, 8)
+    ax.imshow(vp, cmap='plasma', vmin=0, vmax=1)
+    ax.set_title("void_prob(虚空)", fontsize=9)
+    ax.axis('off')
+    return fig
 
     def plot(self, figsize=(10, 6)):
         fig, ax = plt.subplots(figsize=figsize)
@@ -279,24 +273,22 @@ def full_sonar_panel(field_64, original_img=None):
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, '.')
-    from src.pipeline import BaguaPipeline
+    from src.pipeline import PhysicalPipeline
+    from src.operators import PhysicalOperatorLayer
     import cv2
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = BaguaPipeline().to(device).eval()
-    ckpt = torch.load("checkpoints_fixedcolor/bootstrap_epoch15.pth", map_location=device)
-    model.fusion.A.data = ckpt['A']
-    model.operator_layer.projections.load_state_dict(ckpt['proj'])
-
+    pipe = PhysicalPipeline().to(device).eval()
     img = cv2.imread("test_maccup.png")
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img_small = cv2.resize(img_rgb, (128, 128))
-    x = torch.from_numpy(img_small).permute(2,0,1).float().unsqueeze(0).to(device) / 255.0
+    x = torch.from_numpy(cv2.resize(img_rgb, (224,224))).permute(2,0,1).float().unsqueeze(0).to(device) / 255.0
+    op_layer = PhysicalOperatorLayer()
 
     with torch.no_grad():
-        field = model(x)
+        base = op_layer(x)
+        field = pipe(x)
 
-    full_sonar_panel(field, original_img=img_small)
-    plt.savefig("test_output/sonar_panel.png", dpi=150, bbox_inches='tight')
+    essence_panel(field, base, cv2.resize(img_rgb, (224,224)))
+    plt.savefig("test_output/essence_panel.png", dpi=150, bbox_inches='tight')
     plt.close()
-    print("✅ test_output/sonar_panel.png")
+    print("✅ test_output/essence_panel.png")
