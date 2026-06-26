@@ -29,7 +29,8 @@ def extract_geo_signature(img_path, pipe):
     x = torch.from_numpy(img_small).permute(2,0,1).float().unsqueeze(0).to(DEVICE)/255
 
     with torch.no_grad():
-        f, e, _ = essence_field_compute(x, pipe, use_appearance=False)
+        f, e, _ = essence_field_compute(x, pipe, use_appearance=False,
+                                         use_global_context=False)
     fs, _ = edge_aware_diffusion(f, e, n_iters=20, alpha=0.15)
     labels, _, _, prototypes = field_to_materials(f, e, n_clusters=2)
 

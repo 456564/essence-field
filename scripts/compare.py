@@ -30,7 +30,8 @@ def extract_signature(img_path, pipe):
 
     with torch.no_grad():
         field_8, edge_metric, _ = essence_field_compute(
-            x, pipe, presmooth_sigma=3.0, edge_scale=5.0)
+            x, pipe, presmooth_sigma=3.0, edge_scale=5.0,
+            use_appearance=False, use_global_context=False)
     field_smooth, _ = edge_aware_diffusion(
         field_8, edge_metric, n_iters=20, alpha=0.15)
     labels, _, _, prototypes = field_to_materials(

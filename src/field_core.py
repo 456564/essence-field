@@ -96,6 +96,99 @@ def compute_edge_metric(operator_maps, edge_scale=5.0, close_radius=2):
     return edge * edge_scale
 
 
+# ═══════════════════════════════════════════════════════════
+# 全局上下文特征（零参数）
+# ═══════════════════════════════════════════════════════════
+
+def multi_scale_operators(norm_ops, fine_sigma=1.0, coarse_sigma=8.0):
+    """
+    Step 1: 像素 ↔ 全局（多尺度分桶）。
+
+    每个算子取两个尺度：
+      fine:   原图（局部几何细节）
+      coarse: 大核模糊（全局结构——"我在全图中的地位"）
+
+    Returns:
+        ms_field: [B, 16, H, W] (8 算子 × 2 尺度)
+    """
+    from .operators import BASE_OPS
+    op_names = list(BASE_OPS.keys())
+    fine_list = []
+    coarse_list = []
+
+    for name in op_names:
+        v = norm_ops[name]  # [B, 1, H, W]
+        fine_list.append(v)
+        # 粗尺度：大核高斯模糊 → 全局上下文
+        coarse = spatial_presmooth(v, sigma=coarse_sigma)
+        coarse_list.append(coarse)
+
+    ms_field = torch.cat(fine_list + coarse_list, dim=1)  # [B, 16, H, W]
+    return ms_field
+
+
+def operator_wrap_features(norm_ops):
+    """
+    Step 2: 像素 ↔ 算子间全局关联（环绕度）。
+
+    对每个算子 A，计算"像素 i 被其他算子的梯度环绕的程度"。
+    物理含义：高 kun_wrap = 我周围环形区域里，其他算子的梯度都指向外 → 我是被围合的容器内部。
+
+    实现：对算子 A，在像素 i 周围取环形邻域的 B 的梯度，计算平均向心度。
+
+    Returns:
+        wrap_field: [B, 8, H, W] 每算子的环绕度
+    """
+    from .operators import BASE_OPS
+    op_names = list(BASE_OPS.keys())
+
+    B = list(norm_ops.values())[0].shape[0]
+    H, W = list(norm_ops.values())[0].shape[2:]
+    device = list(norm_ops.values())[0].device
+    dtype = list(norm_ops.values())[0].dtype
+
+    # Sobel 梯度核
+    sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
+                           dtype=dtype, device=device)
+
+    wrap_list = []
+    for name_A in op_names:
+        A = norm_ops[name_A]  # [B, 1, H, W]
+
+        # 其他 7 个算子的梯度平均
+        outer_grad = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
+        for name_B in op_names:
+            if name_B == name_A:
+                continue
+            B_val = norm_ops[name_B]
+            gx = F.conv2d(B_val, sobel_x, padding=1)
+            gy = F.conv2d(B_val, sobel_x.transpose(2, 3), padding=1)
+            outer_grad += torch.sqrt(gx ** 2 + gy ** 2 + 1e-8) / 7.0
+
+        # 在 A 值高的像素周围，外层梯度是否强
+        # 用距离加权：环形邻域（半径 5-15）的梯度均值
+        r_inner, r_outer = 3, 15
+        ks = r_outer * 2 + 1
+        box = torch.ones(1, 1, ks, ks, device=device, dtype=dtype) / (ks * ks)
+        outer_grad_ring = F.conv2d(
+            F.pad(outer_grad, [r_outer]*4, mode='reflect'),
+            box)
+        # 减去内环（近邻梯度不算"环绕"）
+        ks_inner = r_inner * 2 + 1
+        box_inner = torch.ones(1, 1, ks_inner, ks_inner, device=device, dtype=dtype) / (ks_inner * ks_inner)
+        outer_grad_near = F.conv2d(
+            F.pad(outer_grad, [r_inner]*4, mode='reflect'),
+            box_inner)
+        ring_grad = (outer_grad_ring - outer_grad_near).clamp(min=0)
+
+        # 环绕度 = A 值 × 外环梯度（A 高 + 外环梯度高 = 我被围合）
+        wrap = A * ring_grad
+        wrap_list.append(wrap)
+
+    wrap_field = torch.cat(wrap_list, dim=1)  # [B, 8, H, W]
+    return wrap_field
+
+
 def appearance_features(x):
     """
     表象层 — 局部相对特征（像素 vs 邻域的差异）。
@@ -177,16 +270,21 @@ def appearance_features(x):
 
 
 def essence_field_compute(x, pipe, presmooth_sigma=3.0, edge_scale=5.0,
-                          use_appearance=True):
+                          use_appearance=True, use_global_context=True):
     """
-    三层本质场 — 表象 + 抽象 → 本质。
+    本质场计算。
 
-    表象层: 颜色纹理亮度 [B, 6, H, W]
-    抽象层: 8 几何算子 [B, 8, H, W]
-    本质层: 拼接后扩散 → 14 维联合场
+    局部层:   8 几何算子 [B, 8, H, W]
+    全局层:   多尺度(16维) + 算子环绕(8维) = [B, 24, H, W]
+    表象层:   局部颜色对比度 [B, 6, H, W]  (可选)
+    本质层:   拼接后扩散 → [B, D, H, W]
+
+    D = 8 + 24 + 6 = 38 (全部)
+      = 8 + 24     = 32 (无表象)
+      = 8          = 8  (纯局部)
 
     Returns:
-        field: [B, D, H, W] 本质场 (D=14 或 D=8)
+        field: [B, D, H, W]
         edge_metric: [B, 1, H, W]
         operator_maps: dict
     """
@@ -203,19 +301,31 @@ def essence_field_compute(x, pipe, presmooth_sigma=3.0, edge_scale=5.0,
     for name in BASE_OPS:
         smooth_ops[name] = spatial_presmooth(norm_ops[name], presmooth_sigma)
     op_vecs = [smooth_ops[name] for name in BASE_OPS]
-    abstract_field = torch.cat(op_vecs, dim=1)  # [B, 8, H, W]
+    abstract_field = torch.cat(op_vecs, dim=1)  # [B, 8, H, W]  抽象层
 
-    # --- 表象层 ---
+    fields = [abstract_field]
+
+    # --- 表象层 (6维) ---
     if use_appearance:
-        appearance_field = appearance_features(x)  # [B, 6, H, W]
-        # 对表象也做空间预平滑（降噪）
-        appearance_field = spatial_presmooth(appearance_field, presmooth_sigma)
-        # 拼接：表象在前 6 维，抽象在后 8 维
-        field = torch.cat([appearance_field, abstract_field], dim=1)  # [B, 14, H, W]
-    else:
-        field = abstract_field  # [B, 8, H, W]
+        app = appearance_features(x)
+        app = spatial_presmooth(app, presmooth_sigma)
+        fields.append(app)
 
-    # 边缘度规（抽象层算子计算，不受表象影响）
+    # --- 全局上下文层 (24维) ---
+    if use_global_context:
+        # Step 1: 多尺度 (16维 = 8×2)
+        ms = multi_scale_operators(norm_ops)
+        ms = spatial_presmooth(ms, presmooth_sigma)
+        fields.append(ms)
+
+        # Step 2: 算子环绕 (8维)
+        wrap = operator_wrap_features(norm_ops)
+        wrap = spatial_presmooth(wrap, presmooth_sigma)
+        fields.append(wrap)
+
+    field = torch.cat(fields, dim=1)
+
+    # 边缘度规（抽象层算子计算，不受其他层影响）
     edge_metric = compute_edge_metric(norm_ops, edge_scale, close_radius=2)
 
     return field, edge_metric, norm_ops
@@ -349,17 +459,21 @@ def describe_material(labels, field_8, operator_names=None):
     """
     C = field_8.shape[1]
     if operator_names is None:
-        if C == 14:
+        if C >= 38:  # 抽象 + 表象 + 全局
+            operator_names = [
+                '乾','坤','震','巽','坎','离','艮','兑',           # 0-7  抽象
+                '亮对比','色相对比','纹理粗细','边缘密度','方向一致','高光', # 8-13 表象
+                '乾细','坤细','震细','巽细','坎细','离细','艮细','兑细',   # 14-21 多尺度细
+                '乾粗','坤粗','震粗','巽粗','坎粗','离粗','艮粗','兑粗',   # 22-29 多尺度粗
+                '乾环','坤环','震环','巽环','坎环','离环','艮环','兑环',   # 30-37 环绕
+            ]
+        elif C == 14:
             operator_names = [
                 '亮对比', '色相对比', '纹理粗细', '边缘密度', '方向一致', '高光',
-                '乾qian(圆)', '坤kun(容器)', '震zhen(边)', '巽xun(纹)',
-                '坎kan(曲)', '离li(能)', '艮gen(块)', '兑dui(比)'
+                '乾', '坤', '震', '巽', '坎', '离', '艮', '兑'
             ]
         else:
-            operator_names = [
-                '乾qian(圆)', '坤kun(容器)', '震zhen(边)', '巽xun(纹)',
-                '坎kan(曲)', '离li(能)', '艮gen(块)', '兑dui(比)'
-            ]
+            operator_names = ['乾','坤','震','巽','坎','离','艮','兑']
 
     vec = field_8[0].permute(1, 2, 0).reshape(-1, C).detach().cpu().numpy()
     H, W = labels.shape
