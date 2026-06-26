@@ -73,12 +73,36 @@ class BaguaPipeline(nn.Module):
     八卦流水线
     输入 [B, 3, H, W] → 64 维卦象场 [B, 64, H, W]
     """
+
     def __init__(self, d=8):
         super().__init__()
         self.operator_layer = MultiDimOperatorLayer()
         self.fusion = BilinearFusion(d=d)
+        self.diffusion = None  # 由外部设置
 
-    def forward(self, x):
+    def forward(self, x, return_operators=False):
+        """
+        Args:
+            x: [B, 3, H, W] 输入图像
+            return_operators: 是否返回原始算子响应（用于可视化/边缘门）
+
+        Returns:
+            若 return_operators=False: field_64
+            若 return_operators=True: (field_64, raw_ops_dict)
+        """
+        # 原始算子响应（instance_norm 前）
+        raw_ops = self.operator_layer.base_ops(x)
+
+        # 投影到多维
         multi_feat = self.operator_layer(x)    # [B, 8, 8, H, W]
+
+        # 双线性融合 → 64 维场
         hexagram = self.fusion(multi_feat)      # [B, 64, H, W]
+
+        # 可选：场自组织扩散
+        if self.diffusion is not None:
+            hexagram, _conv = self.diffusion(hexagram, raw_ops)
+
+        if return_operators:
+            return hexagram, raw_ops
         return hexagram
