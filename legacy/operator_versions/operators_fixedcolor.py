@@ -68,8 +68,8 @@ def _qian(ch):
             s = s[:, :, pd:pd+H, pd:pd+W]
             smp.append(s)
         smp = torch.stack(smp, dim=1)
-        var_map = smp.var(dim=1, unbiased=False) + 1e-6
-        out.append(1.0 / var_map)  # 方差小=一致性强=输出大
+        var_map = smp.var(dim=1, unbiased=False) + 0.01  # 上界≈100，防1/方差爆炸
+        out.append(1.0 / var_map)
     return torch.stack(out, dim=0).mean(dim=0) * energy
 
 

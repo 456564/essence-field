@@ -181,32 +181,22 @@ def overlay_gua_on_image(field_64, original_img, gua_idx, alpha=0.5, cmap=None):
 
 
 def blended_gua_response(field_64):
-    """
-    8卦强度加法混合：每个卦用自己的专属颜色，按归一化强度累加
-    强卦亮色、弱卦暗色、无响应=黑
-    返回 RGB uint8 图像
-    """
+    """PCA投影: 64维场→3维RGB, 同物相近=同色"""
     B, C, H, W = field_64.shape
-    colors = np.array([plt.cm.colors.hex2color(c) for c in GUA_COLORS])  # [8,3]
+    f = field_64[0].reshape(C, -1).t().cpu().numpy()  # [H*W, 64]
 
-    rgb = np.zeros((H, W, 3), dtype=np.float32)
-    for i in range(8):
-        block = field_64[0, i*8:(i+1)*8, :, :]
-        spat = block.norm(dim=0).cpu().numpy()  # [H, W]
-        # 每个卦内部归一化到 [0,1]
-        lo, hi = np.percentile(spat, 2), np.percentile(spat, 98)
-        spread = hi - lo
-        if spread > 1e-6:
-            normed = np.clip((spat - lo) / spread, 0, 1)
-        else:
-            normed = spat - lo
-        # 累加：颜色 × 强度
-        rgb += normed[:, :, np.newaxis] * colors[i][np.newaxis, np.newaxis, :]
+    # 采样加速: 取1/16像素做PCA
+    idx = np.random.choice(f.shape[0], min(4096, f.shape[0]), replace=False)
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=3).fit(f[idx])
+    rgb = pca.transform(f)  # [H*W, 3]
 
-    # 截断到 [0,1]
-    rgb = np.clip(rgb, 0, 1)
-    return (rgb * 255).astype(np.uint8)
+    # 每通道归一化到[0,1]
+    for c in range(3):
+        lo, hi = np.percentile(rgb[:,c], 2), np.percentile(rgb[:,c], 98)
+        rgb[:,c] = np.clip((rgb[:,c] - lo) / (hi - lo + 1e-6), 0, 1)
 
+    return (rgb.reshape(H, W, 3) * 255).astype(np.uint8)
 
 def argmax_gua_composite(field_64, original_img=None):
     """

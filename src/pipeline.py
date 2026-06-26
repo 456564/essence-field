@@ -1,72 +1,55 @@
 """
-八卦→64卦 流水线
+物理算子流水线
 
-核心数据结构：64 维卦象场 [B, 64, H, W]
-  - 每个像素有自己的 64 维向量
-  - 同一物质的像素有相似的 64 维向量
-  - 64 维向量不是图片级别的描述，是像素级别的
+RGB → 8物理算子 → 投影 → 64维本质场
 
-任何取全图均值的做法都是错误的。
+简化版：单投影无融合。先验证算子有效性，后续再加双投影融合。
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from .operators import BAGUA_OPERATORS
+from .operators import PhysicalOperatorLayer
 
-# 算子层选择：colormod 版用 nn.Module 实现
-try:
-    from .operators import ColorModulatedOperatorLayer as _BaseOps
-    _HAS_COLORMOD = True
-except ImportError:
-    from .operators import BaguaOperatorLayer as _BaseOps
-    _HAS_COLORMOD = False
+PHYSICAL_OPERATOR_NAMES = ['dong', 'jing', 'gang', 'rou', 'ju', 'san', 'yang', 'yin']
 
 
-class BilinearFusion(nn.Module):
+class PhysicalPipeline(nn.Module):
     """
-    可学习双线性融合
-    输入：8×8 特征矩阵 F（每像素）
-    输出：8×8 交互矩阵（64 维）
-    """
-    def __init__(self, d=8):
-        super().__init__()
-        self.A = nn.Parameter(torch.randn(d, d) * 0.1)
+    物理算子流水线 — 单层
 
-    def forward(self, F):
-        B, n_ops, d, H, W = F.shape
-        F_perm = F.permute(0, 3, 4, 1, 2)  # [B, H, W, 8, d]
-        FA = torch.matmul(F_perm, self.A)
-        interact = torch.matmul(FA, F_perm.transpose(-1, -2))  # [B, H, W, 8, 8]
-        hexagram = interact.reshape(B, H, W, n_ops * n_ops).permute(0, 3, 1, 2)
-        return hexagram
-
-
-class MultiDimOperatorLayer(nn.Module):
+    RGB [B,3,H,W]
+      ↓ PhysicalOperatorLayer
+    8 响应图 [B,8,H,W]
+      ↓ 1×1 conv 投影 (8→1 per operator → 8-dim each)
+    8×8 特征 [B,8,8,H,W]
+      ↓ reshape
+    64 维本质场 [B,64,H,W]
     """
-    多维算子层
-    每个算子输出 8 维特征 → [B, 8, 8, H, W]
-    """
+
     def __init__(self):
         super().__init__()
-        self.base_ops = _BaseOps()
+        self.operator_layer = PhysicalOperatorLayer()
+        # 每个算子独立投影：1 通道 → 8 维
         self.projections = nn.ModuleDict({
-            name: nn.Conv2d(1, 8, 1) for name in BAGUA_OPERATORS
+            name: nn.Conv2d(1, 8, 1, bias=False)
+            for name in PHYSICAL_OPERATOR_NAMES
         })
+        # 投影权重初始化为正值（非负约束）
+        for proj in self.projections.values():
+            nn.init.uniform_(proj.weight, 0.0, 0.5)
+            # 对角线初始化为 1（恒等偏好）
+            with torch.no_grad():
+                for i in range(min(proj.weight.shape[0], proj.weight.shape[1])):
+                    proj.weight[i, i] = 1.0
 
     def forward(self, x):
-        base_maps = self.base_ops(x)
-        multi_maps = []
-        for name in BAGUA_OPERATORS:
-            out = base_maps[name]
-            # 算子输出的强度图范围差异大（1/方差可达上万），
-            # 用无参数实例归一化稳定尺度，不改变相对强度关系。
-            out = F.instance_norm(out)
-            feat = self.projections[name](out)
-            multi_maps.append(feat)
-        return torch.stack(multi_maps, dim=1)
+        base = self.operator_layer(x)  # [B, 8, H, W]
 
+        multi = []
+        for i, name in enumerate(PHYSICAL_OPERATOR_NAMES):
+            ch = base[:, i:i+1, :, :]                # [B, 1, H, W]
+            feat = self.projections[name](ch)          # [B, 8, H, W]
+            multi.append(feat)
 
 class BaguaPipeline(nn.Module):
     """
