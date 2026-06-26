@@ -16,8 +16,8 @@ plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 from src.pipeline import BaguaPipeline
-from src.field_core import (essence_field_compute, edge_aware_diffusion,
-                             field_to_materials, describe_material)
+from src.field_core import essence_field_compute
+from src.field_dynamics import field_dynamics_pipeline
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 SIZE = 256
@@ -35,15 +35,14 @@ def run(img_path, presmooth_sigma=3.0, edge_scale=5.0, n_iters=20):
     img_small = cv2.resize(img_rgb, (SIZE, SIZE))
     x = torch.from_numpy(img_small).permute(2,0,1).float().unsqueeze(0).to(DEVICE)/255
 
-    # 零参数管线
+    # 场交互动力学管线 v1.0 — 物质=场的稳定态
     with torch.no_grad():
-        field_8, edge_metric, norm_ops = essence_field_compute(
-            x, pipe, presmooth_sigma=presmooth_sigma, edge_scale=edge_scale)
-    field_smooth, conv = edge_aware_diffusion(
-        field_8, edge_metric, n_iters=n_iters, alpha=0.15)
-    labels, _, _, _ = field_to_materials(
-        field_8, edge_metric, n_clusters=3)
-    materials = describe_material(labels, field_smooth)
+        field, edge_metric, norm_ops = essence_field_compute(
+            x, pipe, presmooth_sigma=presmooth_sigma, edge_scale=edge_scale,
+            use_appearance=False, use_global_context=False)
+    labels, field_relaxed, conv, n_materials = field_dynamics_pipeline(
+        field, edge_metric, n_relax_iters=30, alpha=0.10,
+        min_region_size=300)
 
     # 多色分割图
     palette = np.array([
@@ -52,7 +51,7 @@ def run(img_path, presmooth_sigma=3.0, edge_scale=5.0, n_iters=20):
     ]) / 255.0
 
     seg = np.zeros((SIZE, SIZE, 3))
-    for k in range(min(6, len(materials))):
+    for k in range(min(6, n_materials)):
         seg[labels == k] = palette[k]
 
     bg = img_small.astype(float) / 255 * 0.35
@@ -65,9 +64,11 @@ def run(img_path, presmooth_sigma=3.0, edge_scale=5.0, n_iters=20):
     axes[2].axis('off')
 
     # 物质描述
-    text = f'Resolution: {orig_w}x{orig_h}  |  Diffusion converged: {conv[-1]:.4f}\n\n'
-    for i, m in enumerate(materials):
-        text += f'M{i+1} ({m["area"]*100:.0f}%): {m["top_operators"]}\n'
+    text = f'Resolution: {orig_w}x{orig_h}  |  Relaxed: {conv[-1]:.6f}\n\n'
+    text += f'Found {n_materials} materials (field stable states)\n'
+    areas = [(labels == k).sum() / (SIZE*SIZE) for k in range(n_materials)]
+    for k in range(n_materials):
+        text += f'M{k+1}: {areas[k]*100:.0f}%\n'
     axes[2].text(0.05, 0.95, text, transform=axes[2].transAxes,
                  fontsize=11, fontfamily='Microsoft YaHei', va='top')
 
@@ -77,10 +78,11 @@ def run(img_path, presmooth_sigma=3.0, edge_scale=5.0, n_iters=20):
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
 
-    print(f'Image: {orig_w}x{orig_h}  |  Diffusion: {conv[-1]:.4f}')
+    print(f'Image: {orig_w}x{orig_h}  |  Relaxed: {conv[-1]:.6f}')
     print(f'Saved: {out}')
-    for i, m in enumerate(materials):
-        print(f'  M{i+1}: {m["area"]*100:.0f}%  [{m["top_operators"]}]')
+    print(f'Materials found: {n_materials} (field stable states)')
+    for k in range(n_materials):
+        print(f'  M{k+1}: {areas[k]*100:.0f}%')
 
 
 if __name__ == '__main__':
