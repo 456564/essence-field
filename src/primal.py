@@ -76,14 +76,12 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
 
 
 def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
-                              repulsion=0.0, coarse_weight=0.08):
+                              repulsion=0.0, coarse_weight_max=0.15):
     """
-    多尺度弛豫。同一规则在粗细两个尺度上同时运行。
+    多尺度弛豫——每像素自适应。
 
-    细尺度(原图): 处理纹理——快速局部演化
-    粗尺度(降采样): 处理轮廓——纹理被平均掉，只剩大结构
-
-    每轮迭代 = 细尺度一步 + 粗尺度一步 → 融合
+    局部碎片化程度高 → 需要粗尺度引导 → blend 权重大
+    局部平坦一致 → 不需要粗尺度 → blend 权重小
     """
     B, C, H, W = field.shape
     phi = field.clone()
@@ -92,11 +90,11 @@ def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
     for _ in range(n_iters):
         prev = phi.clone()
 
-        # 细尺度: 原图上的吸引+排斥（快速处理纹理）
+        # 细尺度: 原图上的吸引+排斥
         phi, _c = primal_relax(phi, tau=tau * 0.5, alpha=alpha * 0.5,
                                 n_iters=1, repulsion=repulsion * 0.3)
 
-        # 粗尺度: 降采样 → 弛豫一步 → 上采样
+        # 粗尺度: 降采样 → 弛豫 → 上采样
         coarse = torch.nn.functional.interpolate(
             phi, scale_factor=0.5, mode='bilinear')
         coarse, _ = primal_relax(coarse, tau=tau * 2.0, alpha=alpha * 0.3,
@@ -104,8 +102,20 @@ def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
         coarse_up = torch.nn.functional.interpolate(
             coarse, size=(H, W), mode='bilinear')
 
-        # 融合: 细尺度主导纹理，粗尺度引导轮廓
-        phi = phi * (1 - coarse_weight) + coarse_up * coarse_weight
+        # 自适应融合权重: 局部碎片化 = 邻域向量标准差
+        kernel = torch.ones(1, 1, 5, 5, device=field.device) / 25
+        phi_mean = torch.nn.functional.conv2d(
+            phi.view(-1, 1, H, W), kernel, padding=2)
+        phi_sq_mean = torch.nn.functional.conv2d(
+            (phi * phi).view(-1, 1, H, W), kernel, padding=2)
+        local_var = (phi_sq_mean - phi_mean * phi_mean).clamp(min=0)
+        local_std = local_var.sqrt().reshape(B, C, H, W).mean(dim=1, keepdim=True)
+
+        # 碎片化 → 权重高
+        adaptive_weight = local_std * coarse_weight_max * 5.0
+        adaptive_weight = adaptive_weight.clamp(0, coarse_weight_max)
+
+        phi = phi * (1 - adaptive_weight) + coarse_up * adaptive_weight
 
         d = (phi - prev).norm() / (phi.norm() + 1e-8)
         conv.append(d.item())
