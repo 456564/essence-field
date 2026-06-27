@@ -55,6 +55,7 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
     B, C, H, W = field.shape
     phi = field.clone()
     conv = []
+    net_force = None
     stability = torch.zeros(B, 1, H, W, device=field.device) if inertia else None
 
     # 每像素的自身性质（从初始场计算，不随演化改变）
@@ -66,11 +67,6 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
     diffs_stack = torch.stack(diffs_init)  # [4, B, 1, H, W]
     tau_map = diffs_stack.median(dim=0)[0].clamp(min=1e-6)      # tau: 中位数距离
     grad_map = diffs_stack.mean(dim=0)                            # 局部梯度 = 平均距离
-
-    # 每像素收敛：冻结 + 解冻（邻居变化则唤醒）
-    frozen = torch.zeros(B, 1, H, W, device=field.device, dtype=torch.bool)
-    stable_count = torch.zeros(B, 1, H, W, device=field.device)
-    freeze_threshold = tau_map * 0.1  # 每像素自己的冻结阈值
 
     for it in range(n_iters):
         prev = phi.clone()
@@ -117,29 +113,15 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
 
         phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
 
-        # 收敛: 冻结+解冻
-        pixel_change = (phi - prev).abs().mean(dim=1, keepdim=True)
-        stable_now = pixel_change < freeze_threshold
-
-        # 冻结: 连续3轮稳定且4邻域也冻结 → 冻住
-        stable_count = torch.where(stable_now, stable_count + 1,
-                                   torch.zeros_like(stable_count))
-        neighbors_frozen = frozen  # 简化: 检查自身是否曾冻过
-        # 简化: 自身稳定3轮+邻域稳定 → 冻住
-        should_freeze = (stable_count >= 3) & ~frozen
-
-        # 解冻: 变化>阈值 → 醒来（邻居在动）
-        should_unfreeze = (~stable_now) & frozen
-
-        frozen = (frozen | should_freeze) & ~should_unfreeze
-
-        d = pixel_change.mean().item()
-        conv.append(d)
-
-        if frozen.all():
+        d = (phi - prev).norm() / (phi.norm() + 1e-8)
+        conv.append(d.item())
+        if d < 1e-4:
             break
 
-    return phi, conv
+    # 净力 = 每像素的最终吸引/排斥残差 — 零=均衡, 大=边界/振荡
+    net_force = (phi - prev).abs().mean(dim=1, keepdim=True)  # [B,1,H,W]
+
+    return phi, conv, net_force
 
 
 def primal_relax_multiscale(field, alpha=0.3, n_iters=50,
@@ -158,13 +140,13 @@ def primal_relax_multiscale(field, alpha=0.3, n_iters=50,
         prev = phi.clone()
 
         # 细尺度: 原图上的吸引+排斥
-        phi, _c = primal_relax(phi, alpha=alpha * 0.5,
+        phi, _c, _f = primal_relax(phi, alpha=alpha * 0.5,
                                 n_iters=1, repulsion=repulsion * 0.3)
 
         # 粗尺度: 降采样 → 弛豫 → 上采样
         coarse = torch.nn.functional.interpolate(
             phi, scale_factor=0.5, mode='bilinear')
-        coarse, _ = primal_relax(coarse, alpha=alpha * 0.3,
+        coarse, _c2, _f2 = primal_relax(coarse, alpha=alpha * 0.3,
                                   n_iters=1, repulsion=repulsion * 0.7)
         coarse_up = torch.nn.functional.interpolate(
             coarse, size=(H, W), mode='bilinear')
@@ -180,34 +162,28 @@ def primal_relax_multiscale(field, alpha=0.3, n_iters=50,
         if d < 1e-4:
             break
 
-    return phi, conv
+    net_force = (phi - prev).abs().mean(dim=1, keepdim=True)
+    return phi, conv, net_force
 
 
-def extract_domains(field_relaxed, grad_pct=75, min_domain_size=None):
+def extract_domains(net_force, grad_pct=75, min_domain_size=None):
     """
-    从弛豫场中提取物质域。
+    从净力场提取物质域。
 
-    场梯度低 = 邻域一致 = 物质内部。连通分量 = 物质域。
+    净力低 = 动态均衡 = 物质内部。
+    净力高 = 持续被拉/推 = 边界/振荡。
 
     Args:
-        field_relaxed: [B, C, H, W]
-        grad_pct: 梯度阈值百分位
-        min_domain_size: 最小域大小（像素数），None=1%面积
-
-    Returns:
-        labels: [H, W] 物质标签
-        n_domains: int
+        net_force: [B, 1, H, W] 或 [H, W] 净力图
     """
-    B, C, H, W = field_relaxed.shape
-    field_np = field_relaxed[0].detach().cpu().numpy()
+    if hasattr(net_force, 'shape') and len(net_force.shape) == 4:
+        force_np = net_force[0, 0].detach().cpu().numpy()
+    else:
+        force_np = np.array(net_force)
+    H, W = force_np.shape
 
-    # 场梯度
-    gy = np.abs(np.diff(field_np, axis=1, append=field_np[:, -1:, :])).mean(0)
-    gx = np.abs(np.diff(field_np, axis=2, append=field_np[:, :, -1:])).mean(0)
-    grad = gy + gx
-
-    # 梯度低 = 物质内部
-    interior = grad < np.percentile(grad, grad_pct)
+    # 净力低 = 物质内部
+    interior = force_np < np.percentile(force_np, grad_pct)
 
     from scipy import ndimage
     labels, n_raw = ndimage.label(interior)

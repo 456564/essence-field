@@ -34,14 +34,14 @@ def run(img_path, alpha=0.3, n_iters=50, repulsion=False,
     # 基元向量
     x = enrich_field(x_rgb) if enrich else x_rgb
 
-    # 场弛豫 (tau 每像素自算)
+    # 场弛豫
     if multiscale:
-        field, conv = primal_relax_multiscale(
+        field, conv, net_force = primal_relax_multiscale(
             x, alpha=alpha, n_iters=n_iters, repulsion=repulsion)
     else:
-        field, conv = primal_relax(x, alpha=alpha, n_iters=n_iters,
+        field, conv, net_force = primal_relax(x, alpha=alpha, n_iters=n_iters,
                                    repulsion=repulsion, inertia=inertia)
-    labels, n_domains = extract_domains(field)
+    labels, n_domains = extract_domains(net_force)  # 净力做边界
 
     # 多色分割
     pal = np.array([[230, 80, 80], [80, 180, 80], [80, 80, 220],
@@ -51,20 +51,17 @@ def run(img_path, alpha=0.3, n_iters=50, repulsion=False,
         seg[labels == k] = pal[k]
     overlay = np.clip(img_small.astype(float) / 255 * 0.35 + seg * 0.65, 0, 1)
 
-    # 梯度边界
-    phi_np = field[0].cpu().numpy()
-    gy = np.abs(np.diff(phi_np, axis=1, append=phi_np[:, -1:, :])).mean(0)
-    gx = np.abs(np.diff(phi_np, axis=2, append=phi_np[:, :, -1:])).mean(0)
-    grad = gy + gx
+    # 净力 = 动态均衡图（零=均衡/物质，大=边界/不确定）
+    eq_np = net_force[0, 0].detach().cpu().numpy()
 
-    # 弛豫后图像（取前3通道 = RGB面）
+    # 弛豫后图像
     phi_vis = field[0, :3].permute(1, 2, 0).cpu().numpy()
     phi_vis = np.clip((phi_vis - phi_vis.min()) / (phi_vis.max() - phi_vis.min() + 1e-8) * 255, 0, 255).astype(np.uint8)
 
     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     axes[0].imshow(img_small); axes[0].set_title('Original'); axes[0].axis('off')
-    axes[1].imshow(phi_vis); axes[1].set_title(f'Primal Field\n({len(conv)} iters)'); axes[1].axis('off')
-    axes[2].imshow(grad, cmap='hot'); axes[2].set_title('Field Gradient\n(= natural boundary)'); axes[2].axis('off')
+    axes[1].imshow(phi_vis); axes[1].set_title(f'Relaxed field\n({len(conv)} steps)'); axes[1].axis('off')
+    axes[2].imshow(eq_np, cmap='hot'); axes[2].set_title('Net force\n(0=equil, bright=boundary)'); axes[2].axis('off')
     axes[3].imshow(overlay); axes[3].set_title(f'{n_domains} Domains'); axes[3].axis('off')
 
     name = os.path.splitext(os.path.basename(img_path))[0]
