@@ -43,26 +43,39 @@ def auto_parameters(field):
 
 def enrich_field(rgb_field):
     """
-    像素能提供什么就放什么。人不做选择。
+    像素的完整信息面。人不选择——压缩来自数学必要性。
 
     信息源1: 自己的值 RGB(3)
-    信息源2: 和4邻域的关系 4方向×3通道差异(12)
-    总共: 15 维
+    信息源2: 和4邻域的关系 4方向梯度L2范数(4)
+    补充: 局部纹理方差(1)
+    = 8维
 
-    不命名维度。不选择"加哪个好"。场的弛豫自己决定。
+    为什么不用 per-channel diff(12维):
+      R_diff ≈ G_diff ≈ B_diff in 大多数像素
+      → 3个高度相关维度只提供了1个有效信息
+      → 用L2范数压缩为1维，保留结构信息，消除冗余
     """
     B, C, H, W = rgb_field.shape
+    device = rgb_field.device
 
     # 自己的值: RGB
     parts = [rgb_field]
 
-    # 和邻域的关系: 每个方向，每个通道的差异
+    # 和邻域的关系: 4方向梯度L2范数（3通道差异压缩为1）
     for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
         nb = torch.roll(rgb_field, shifts=(dy, dx), dims=(2, 3))
-        diff = rgb_field - nb  # [B, 3, H, W] — per-channel difference
-        parts.append(diff)
+        diff_l2 = (rgb_field - nb).pow(2).sum(dim=1, keepdim=True).sqrt()
+        parts.append(diff_l2)
 
-    # 15维: 3 (self) + 3×4 (relations) = 15
+    # 纹理面: 局部方差
+    kernel = torch.ones(1, 1, 5, 5, device=device) / 25
+    gray = rgb_field.mean(dim=1, keepdim=True)
+    local_mean = F.conv2d(gray, kernel, padding=2)
+    local_sq_mean = F.conv2d(gray * gray, kernel, padding=2)
+    local_var = (local_sq_mean - local_mean * local_mean).clamp(min=0)
+    parts.append(local_var)
+
+    # 8维: 3 (self) + 4 (gradient) + 1 (texture)
     return torch.cat(parts, dim=1)
 
 
