@@ -180,3 +180,74 @@ def extract_domains(field_relaxed, grad_pct=75, min_domain_size=None):
     labels = labels.clip(min=0)
     n_domains = labels.max() + 1 if labels.max() >= 0 else 0
     return labels, n_domains
+
+
+def hierarchical_decompose(field, tau=0.02, alpha=0.3, n_iters=50,
+                            flags=8, max_depth=3, min_size=200):
+    """
+    层级递归——在每个稳定域内部再次弛豫，直到不再分裂。
+
+    流水遇石则分，遇潭则止。
+    场遇到内部结构则递归，遇到均匀区域则停止。
+
+    Args:
+        field: [B, C, H, W] primal vector
+        tau, alpha, n_iters: primal parameters
+        flags: rule combination
+        max_depth: maximum recursion depth
+        min_size: minimum pixel count to recurse into
+
+    Returns:
+        hierarchy: list of dicts [{label, depth, mask, parent}]
+    """
+    hierarchy = []
+    _recurse(field, tau, alpha, n_iters, flags, 0, max_depth,
+             min_size, None, hierarchy)
+    return hierarchy
+
+
+def _recurse(field, tau, alpha, n_iters, flags, depth, max_depth,
+             min_size, parent_label, hierarchy):
+    """递归核心——收敛检查：子域无明显分化→停止"""
+    if depth > max_depth:
+        return
+
+    labels, n_domains = extract_domains(field)
+
+    # 收敛: 不分 → 停止
+    if n_domains <= 1:
+        return
+    # 最大域占 >80% → 碎片 → 停止
+    sizes = [(labels == k).sum() for k in range(n_domains)]
+    sizes.sort(reverse=True)
+    if sizes[0] > sum(sizes) * 0.8:
+        return
+    # 子域不足 3 个 → 无递归意义
+    if n_domains < 2:
+        return
+
+    B, C, H, W = field.shape
+    field_np = field[0].cpu().numpy()
+
+    for k in range(n_domains):
+        mask = labels == k
+        size = mask.sum()
+        if size < min_size:
+            continue
+
+        label_id = len(hierarchy)
+        hierarchy.append({
+            'label': label_id, 'depth': depth, 'mask': mask,
+            'parent': parent_label, 'size_pct': size / (H * W) * 100,
+        })
+
+        # 递归: 裁剪子区域，重新弛豫
+        if size > min_size * 3 and depth < max_depth:
+            ys, xs = np.where(mask)
+            y0, y1 = ys.min(), ys.max() + 1
+            x0, x1 = xs.min(), xs.max() + 1
+            child_region = field_np[:, y0:y1, x0:x1]
+            child_tensor = torch.from_numpy(child_region).unsqueeze(0).to(
+                field.device)
+            _recurse(child_tensor, tau, alpha, n_iters, flags,
+                     depth + 1, max_depth, min_size, label_id, hierarchy)
