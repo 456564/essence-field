@@ -196,29 +196,16 @@ def extract_domains(field_relaxed, grad_pct=None, min_domain_size=None):
     gx = np.abs(np.diff(field_np, axis=2, append=field_np[:, :, -1:])).mean(0)
     grad = gy + gx
 
-    # 自动阈值：梯度直方图 Otsu 分割（内部 vs 边界）
+    # 自动阈值：梯度累积能量肘点（不假设双峰分布）
     if grad_pct is None:
-        grad_flat = grad.flatten()
-        # Otsu: maximize between-class variance
-        hist, bins = np.histogram(grad_flat, bins=128)
-        total = hist.sum()
-        best_t, best_var = 0, 0
-        sum_all = (hist * bins[:-1]).sum()
-        sum_b, w_b = 0, 0
-        for i in range(len(hist)):
-            w_b += hist[i]
-            if w_b == 0 or w_b == total:
-                continue
-            sum_b += hist[i] * bins[i]
-            w_f = total - w_b
-            sum_f = sum_all - sum_b
-            between = w_b * w_f * (sum_b / w_b - sum_f / w_f) ** 2
-            if between > best_var:
-                best_var = between
-                best_t = bins[i]
-        # 阈值 → 百分位
-        grad_pct = (grad_flat < best_t).mean() * 100
-        grad_pct = max(50, min(95, grad_pct))  # 钳制合理范围
+        grad_flat = np.sort(grad.flatten())[::-1]  # 降序
+        cumsum = np.cumsum(grad_flat)
+        cumsum = cumsum / cumsum[-1]  # 归一化 [0,1]
+        # 肘点: 前N%的梯度贡献了50%的总能量 → N% = 边界比例
+        # 剩余(100-N)%贡献了另50% = 内部
+        knee_idx = np.searchsorted(cumsum, 0.5)
+        grad_pct = 100 - (knee_idx / len(grad_flat)) * 100
+        grad_pct = max(40, min(90, grad_pct))
 
     interior = grad < np.percentile(grad, grad_pct)
 
