@@ -1,5 +1,8 @@
 # 物理本质空间 — 8物理算子视觉架构
 
+> 2026-06-26 新方向: Primal Field — 单一规则 + 四条交互法则 → 物质自涌现
+> 详见 ROADMAP.md 和 C:\Users\888\.claude\plans\harmonic-coalescing-giraffe.md 第十/十一章
+
 ## 系统全景（零参数版 — 2026-06-24）
 
 ### 输入 → 输出
