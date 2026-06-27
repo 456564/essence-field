@@ -42,11 +42,11 @@ def run(img_path, presmooth_sigma=3.0, edge_scale=5.0, n_iters=20):
             use_appearance=True, use_global_context=False)
     field_smooth, conv = edge_aware_diffusion(
         field, edge_metric, n_iters=n_iters, alpha=0.15)
-    labels, _, _, prototypes = field_to_materials(
+    labels, _, _, prototypes, domain_stats = field_to_materials(
         field, edge_metric)
 
     n_materials = len(prototypes)
-    areas = [(labels == k).sum() / (SIZE*SIZE) for k in range(n_materials)]
+    areas = [ds['area_pct'] for ds in domain_stats]
 
     # 多色分割图
     palette = np.array([
@@ -69,9 +69,12 @@ def run(img_path, presmooth_sigma=3.0, edge_scale=5.0, n_iters=20):
     axes[2].axis('off')
 
     text = f'Resolution: {orig_w}x{orig_h}  |  Diffusion: {conv[-1]:.4f}\n\n'
-    text += f'Materials found: {n_materials} (watershed on field gradient)\n'
+    text += f'Domains found: {n_materials} (field stable states)\n'
     for k in range(n_materials):
-        text += f'M{k+1}: {areas[k]*100:.0f}%\n'
+        ds = domain_stats[k]
+        text += (f'M{k+1}: {ds["area_pct"]:.0f}%  '
+                 f'AbsC={ds["abstract_consistency"]:.2f}  '
+                 f'AppC={ds["appearance_consistency"]:.2f}\n')
     axes[2].text(0.05, 0.95, text, transform=axes[2].transAxes,
                  fontsize=11, fontfamily='Microsoft YaHei', va='top')
 
@@ -83,9 +86,12 @@ def run(img_path, presmooth_sigma=3.0, edge_scale=5.0, n_iters=20):
 
     print(f'Image: {orig_w}x{orig_h}  |  Diffusion: {conv[-1]:.4f}')
     print(f'Saved: {out}')
-    print(f'Materials found: {n_materials}')
+    print(f'Domains: {n_materials}')
     for k in range(n_materials):
-        print(f'  M{k+1}: {areas[k]*100:.0f}%')
+        ds = domain_stats[k]
+        print(f'  M{k+1}: {ds["area_pct"]:.0f}%  '
+              f'AbsC={ds["abstract_consistency"]:.2f}  '
+              f'AppC={ds["appearance_consistency"]:.2f}')
 
 
 if __name__ == '__main__':

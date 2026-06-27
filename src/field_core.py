@@ -319,20 +319,20 @@ def essence_field_compute(x, pipe, presmooth_sigma=3.0, edge_scale=5.0,
 
     fields = [abstract_field]
 
-    # --- 表象层 (6维) ---
+    # --- 本质层 = 表象⊗抽象外积(48) + 抽象基线(8) = 56维 ---
     if use_appearance:
         app = appearance_features(x)
         app = spatial_presmooth(app, presmooth_sigma)
 
-        # --- 跨层融合: 表象⊗抽象外积 → 48维 ---
+        # 外积融合: 表象×抽象 → 物质定义
         B, _, H, W = app.shape
         app_exp = app.unsqueeze(2)           # [B, 6, 1, H, W]
         abs_exp = abstract_field.unsqueeze(1) # [B, 1, 8, H, W]
         cross = (app_exp * abs_exp).reshape(B, 48, H, W)
         cross = spatial_presmooth(cross, presmooth_sigma * 0.5)
         fields.append(cross)
-        # 也保留原始表象（作为对比基准）
-        fields.append(app)
+        # 不加原始表象——表象孤立无意义。
+        # "这个像素亮不亮"取决于"它在容器内部还是背景"。
 
     # --- 全局上下文层 (24维) ---
     if use_global_context:
@@ -348,10 +348,15 @@ def essence_field_compute(x, pipe, presmooth_sigma=3.0, edge_scale=5.0,
 
     field = torch.cat(fields, dim=1)
 
-    # 联合边缘度规 = 表象梯度 + 抽象算子梯度
-    appearance_for_edge = appearance_features(x) if use_appearance else None
-    edge_metric = compute_essence_edge(norm_ops, appearance_for_edge,
-                                        edge_scale, close_radius=2)
+    # 边缘度规 = zhen + li（已验证组合）
+    e = robust_normalize(norm_ops['zhen']) + robust_normalize(norm_ops['li'])
+    e = robust_normalize(e)
+    # 强闭运算：11×11 膨胀+腐蚀 → 填充键帽缝隙（细边）
+    #           同时保留物体轮廓（粗边）
+    ks = 11
+    dilated = F.max_pool2d(e, ks, 1, padding=ks//2)
+    eroded = -F.max_pool2d(-dilated, ks, 1, padding=ks//2)
+    edge_metric = eroded * edge_scale
 
     return field, edge_metric, norm_ops
 
@@ -408,122 +413,137 @@ def edge_aware_diffusion(field, edge_metric, n_iters=20, alpha=0.2):
     return phi, convergence
 
 
-def field_to_materials(field_8, edge_metric=None, n_clusters=None):
+def field_to_materials(field_8, edge_metric=None, n_clusters=None,
+                        min_domain_pct=1.0):
     """
-    从本质场提取物质——稳定态连通分量（替换 K-means）。
+    物质 = 场的稳定连通域。不做聚类，不做内部分割。
 
-    先边缘感知扩散，再找场的"盆地"（稳定态），
-    每个盆地 = 一种物质。不需要指定 K。
+    1. 扩散 → 同结构像素趋同
+    2. 边缘度规 → 连通域边界
+    3. 连通域 = 物质。域内差异不切分——只报告一致性。
 
     Args:
         field_8: [B, D, H, W] 本质向量场
-        edge_metric: [B, 1, H, W] 边缘度规
-        n_clusters: 忽略（保留兼容性）
+        edge_metric: [B, 1, H, W]
 
     Returns:
         labels: [H, W] 物质标签
         field_smoothed: [B, D, H, W] 扩散后场
         convergence: list[float]
         prototypes: [K, D] 物质原型向量
+        domain_stats: list[dict] 每域: {abstract_consistency, appearance_consistency}
     """
-    # 扩散
     if edge_metric is None:
         edge_metric = torch.zeros(1, 1, field_8.shape[2], field_8.shape[3],
                                   device=field_8.device)
-    field_smooth, convergence = edge_aware_diffusion(field_8, edge_metric)
+
+    # 强扩散——假设互相验证 → 同结构像素趋同
+    field_smooth, convergence = edge_aware_diffusion(
+        field_8, edge_metric, n_iters=30, alpha=0.15)
 
     C = field_smooth.shape[1]
     H, W = field_8.shape[2], field_8.shape[3]
     field_np = field_smooth[0].detach().cpu().numpy()  # [C, H, W]
-    edge_np = edge_metric[0, 0].detach().cpu().numpy()
 
-    # ---- Step 1: 计算场的局部梯度（场变化幅度）----
+    # 边界 = 扩散后场自身的梯度。梯度低=假设一致=物质内部。
     grad_y = np.abs(np.diff(field_np, axis=1, append=field_np[:, -1:, :]))
     grad_x = np.abs(np.diff(field_np, axis=2, append=field_np[:, :, -1:]))
-    field_grad = np.sqrt(np.mean(grad_y**2 + grad_x**2, axis=0))  # [H, W]
+    field_grad = np.mean(grad_y, axis=0) + np.mean(grad_x, axis=0)
 
-    # ---- Step 2: 先过分割 → 按盆地深度合并（像水自然沉淀） ----
+    # 流域：找场梯度中的盆地 → 物质域
     from scipy import ndimage
+    from skimage.segmentation import watershed
     from skimage.feature import peak_local_max
 
-    elevation = field_grad + edge_np * 1.5
-    elevation = ndimage.gaussian_filter(elevation, sigma=4.0)
-    # 过量找峰——先细分，后面按自然深度合并
-    minima = peak_local_max(
-        -elevation, min_distance=20,
-        threshold_abs=-np.percentile(elevation, 50),
-        exclude_border=True, num_peaks=10)
+    elevation = ndimage.gaussian_filter(field_grad, sigma=4.0)
+    minima = peak_local_max(-elevation, min_distance=30,
+                            threshold_abs=-np.percentile(elevation, 60),
+                            exclude_border=True)
 
-    if len(minima) <= 1:
-        # 找不到足够盆地 → 回退到单个物质
+    if len(minima) < 2:
         labels = np.zeros((H, W), dtype=int)
-        prototypes = np.array([field_np.mean(axis=(1, 2))])
-        return labels, field_smooth, convergence, prototypes
+    else:
+        markers = np.zeros((H, W), dtype=int)
+        for i, (y, x) in enumerate(minima):
+            markers[y, x] = i + 1
+        labels = watershed(elevation, markers)
 
-    # ---- Step 3: 流域分割 ----
-    from skimage.segmentation import watershed
-    markers = np.zeros((H, W), dtype=int)
-    for i, (y, x) in enumerate(minima):
-        markers[y, x] = i + 1
+        # 合并小块
+        min_size = int(H * W * min_domain_pct / 100)
+        if min_size < 100:
+            min_size = 100
+        n_labels = labels.max()
+        sizes = ndimage.sum(np.ones_like(labels), labels, index=range(1, n_labels + 1))
+        new_labels = np.zeros_like(labels)
+        next_id = 1
+        for lid in range(1, n_labels + 1):
+            if sizes[lid - 1] >= min_size:
+                new_labels[labels == lid] = next_id
+                next_id += 1
+        labels = new_labels - 1
+        labels = labels.clip(min=0)
 
-    labels = watershed(elevation, markers)
-
-    # ---- Step 4: 盆地深度合并——深=真物质，浅=噪声碎片 ----
-    n_labels = labels.max()
-    basin_depth = {lid: elevation[labels == lid].max() - elevation[labels == lid].min()
-                   for lid in range(1, n_labels + 1)}
-    max_depth = max(basin_depth.values())
-    deep = {lid for lid, d in basin_depth.items() if d >= max_depth * 0.25}
-
-    from scipy.ndimage import binary_dilation
-    merged = labels.copy()
-    for lid in sorted(range(1, n_labels + 1), key=lambda x: basin_depth[x]):
-        if lid in deep: continue
-        mask = labels == lid
-        border = binary_dilation(mask, iterations=1) & ~mask
-        neighbors = {n for n in set(labels[border]) if n not in (0, lid)}
-        if neighbors:
-            best = max(neighbors, key=lambda n: basin_depth.get(n, 0))
-            merged[merged == lid] = best
-            basin_depth[best] = max(basin_depth[best], basin_depth[lid])
-
-    labels = merged
-    for u, c in zip(*np.unique(labels, return_counts=True)):
-        if u > 0 and c < H * W // 200:
-            labels[labels == u] = 0
-
-    final_unique = sorted(set(labels[labels > 0]))
-    final_labels = np.zeros_like(labels)
-    prototypes_list = []
-    for new_id, old_id in enumerate(final_unique, 1):
-        mask = labels == old_id
-        final_labels[mask] = new_id
-        prototypes_list.append(field_np[:, mask].mean(axis=1))
-
-    if not prototypes_list:
+    # 未标记像素 → 最近邻
+    from scipy.spatial import KDTree
+    if labels.max() >= 0:
+        n = labels.max() + 1
+        unlabeled = labels == 0
+        if unlabeled.any() and n > 0:
+            ly, lx = np.where(~unlabeled)
+            lv = labels[~unlabeled]
+            tree = KDTree(np.column_stack([ly, lx]))
+            uy, ux = np.where(unlabeled)
+            if len(uy) > 0:
+                _, nn = tree.query(np.column_stack([uy, ux]))
+                labels[uy, ux] = lv[nn]
+    else:
+        n = 1
         labels = np.zeros((H, W), dtype=int)
-        prototypes = np.array([field_np.mean(axis=(1, 2))])
-        return labels, field_smooth, convergence, prototypes
 
-    labels = final_labels
-    prototypes = np.array(prototypes_list)
-    n_materials = len(final_unique)
+    # 原型 + 一致性统计
+    n = labels.max() + 1
+    prototypes = []
+    domain_stats = []
+    for k in range(n):
+        mask = labels == k
+        if mask.sum() > 0:
+            vec_k = field_np[:, mask]
+            mean_k = vec_k.mean(axis=1)
+            prototypes.append(mean_k)
 
-    # ---- Step 5: 填充未标记像素 ----
-    unlabeled = labels == 0
-    if unlabeled.any() and n_materials > 0:
-        from scipy.spatial import KDTree
-        lys, lxs = np.where(~unlabeled)
-        lvals = labels[~unlabeled]
-        tree = KDTree(np.column_stack([lys, lxs]))
-        uys, uxs = np.where(unlabeled)
-        _, nearest = tree.query(np.column_stack([uys, uxs]))
-        labels[uys, uxs] = lvals[nearest]
+            # 分离抽象(后8维)和表象(前部分)
+            # 场结构: 抽象基线在最后8维, 融合48维在前
+            if C >= 56:  # 56维 = 48融合 + 8抽象
+                abs_dim = 8
+                abs_vec = vec_k[-abs_dim:, :]
+                app_vec = vec_k[:-abs_dim, :]
+            else:
+                abs_vec = vec_k[-8:, :] if C >= 8 else vec_k
+                app_vec = vec_k[:-8, :] if C > 8 else np.zeros((1, vec_k.shape[1]))
 
-    # 确保 0-indexed
-    labels = labels.clip(min=1) - 1
+            # 抽象一致性 = 1 / (1 + 域内向量方差)
+            abs_var = np.var(abs_vec, axis=1).mean()
+            abs_consistency = 1.0 / (1.0 + abs_var)
 
-    return labels, field_smooth, convergence, prototypes
+            # 表象一致性
+            if app_vec.shape[0] > 0 and app_vec.shape[1] > 0:
+                app_var = np.var(app_vec, axis=1).mean()
+                app_consistency = 1.0 / (1.0 + app_var)
+            else:
+                app_consistency = 0.0
+
+            domain_stats.append({
+                'area_pct': mask.sum() / (H * W) * 100,
+                'abstract_consistency': float(abs_consistency),
+                'appearance_consistency': float(app_consistency),
+            })
+        else:
+            prototypes.append(np.zeros(C))
+            domain_stats.append({'area_pct': 0, 'abstract_consistency': 0,
+                                'appearance_consistency': 0})
+    prototypes = np.array(prototypes)
+
+    return labels, field_smooth, convergence, prototypes, domain_stats
 
 
 def describe_material(labels, field_8, operator_names=None):
@@ -532,7 +552,7 @@ def describe_material(labels, field_8, operator_names=None):
 
     Args:
         labels: [H, W] 物质标签
-        field_8: [B, 8, H, W] 本质场（扩散后）
+        field_8: [B, C, H, W] 本质场（扩散后）
 
     Returns:
         materials: list[dict]
