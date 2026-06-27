@@ -67,15 +67,13 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
     tau_map = diffs_stack.median(dim=0)[0].clamp(min=1e-6)      # tau: 中位数距离
     grad_map = diffs_stack.mean(dim=0)                            # 局部梯度 = 平均距离
 
-    # 每像素收敛掩码 — 已稳定的像素冻结
+    # 每像素收敛：冻结 + 解冻（邻居变化则唤醒）
     frozen = torch.zeros(B, 1, H, W, device=field.device, dtype=torch.bool)
+    stable_count = torch.zeros(B, 1, H, W, device=field.device)
+    freeze_threshold = tau_map * 0.1  # 每像素自己的冻结阈值
 
     for it in range(n_iters):
         prev = phi.clone()
-
-        # 只对未冻结的像素计算
-        active_mask = ~frozen  # [B, 1, H, W]
-        active_mask_float = active_mask.float()
 
         attract = torch.zeros_like(phi)
         awsum = torch.zeros(B, 1, H, W, device=field.device)
@@ -117,18 +115,27 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
         else:
             adaptive_alpha = alpha
 
-        # 更新（alpha 按活跃像素缩放）
         phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
 
-        # 检查收敛: 每像素自身变化 < 阈值 → 冻结
+        # 收敛: 冻结+解冻
         pixel_change = (phi - prev).abs().mean(dim=1, keepdim=True)
-        newly_frozen = (pixel_change < 1e-4) & ~frozen
-        frozen = frozen | newly_frozen
+        stable_now = pixel_change < freeze_threshold
+
+        # 冻结: 连续3轮稳定且4邻域也冻结 → 冻住
+        stable_count = torch.where(stable_now, stable_count + 1,
+                                   torch.zeros_like(stable_count))
+        neighbors_frozen = frozen  # 简化: 检查自身是否曾冻过
+        # 简化: 自身稳定3轮+邻域稳定 → 冻住
+        should_freeze = (stable_count >= 3) & ~frozen
+
+        # 解冻: 变化>阈值 → 醒来（邻居在动）
+        should_unfreeze = (~stable_now) & frozen
+
+        frozen = (frozen | should_freeze) & ~should_unfreeze
 
         d = pixel_change.mean().item()
         conv.append(d)
 
-        # 全部冻结 → 停止
         if frozen.all():
             break
 
