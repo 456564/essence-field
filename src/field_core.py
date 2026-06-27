@@ -57,43 +57,57 @@ def spatial_presmooth(tensor, sigma=3.0):
     return out.view(B, C, H, W)
 
 
-def compute_edge_metric(operator_maps, edge_scale=5.0, close_radius=2):
+def compute_essence_edge(norm_ops, appearance_field=None, edge_scale=5.0,
+                         close_radius=2):
     """
-    从算子计算边缘感知度规。
-    度规 d(p, q) = |p-q|_spatial * (1 + edge * edge_scale)
+    联合边缘度规 — 表象梯度 + 抽象算子梯度的最大值。
 
-    边缘 = 震(拉普拉斯) + 离(梯度幅值) 的组合。
-    度规值高 → 场跨越此处困难 → 物质边界自然形成。
+    单zhen只检测强度边缘。联合度规捕获所有边界类型：
+      强度边(震/离)、纹理边(艮)、曲率边(坎)、容器边(坤)、颜色边(表象)
 
-    闭运算（先膨胀后腐蚀）：填充薄缝（如键帽间隙），
-    只保留厚轮廓（如物体边界）。
-
-    Args:
-        close_radius: 形态学闭运算半径。越大填充越宽的缝隙。
+    零参数——所有梯度都是Sobel卷积。
 
     Returns:
-        metric: [B, 1, H, W] 度规强度（0 = 无边缘，大 = 强边缘）
+        metric: [B, 1, H, W] 联合边缘强度
     """
-    zhen = operator_maps['zhen']
-    li = operator_maps['li']
-    edge = robust_normalize(zhen) + robust_normalize(li)
-    edge = robust_normalize(edge)  # [0, 1]
+    sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]],
+                           dtype=list(norm_ops.values())[0].dtype,
+                           device=list(norm_ops.values())[0].device)
+    sobel_y = sobel_x.transpose(2, 3)
 
-    # 形态学闭运算：填充薄缝，保留厚边
+    B = list(norm_ops.values())[0].shape[0]
+    H, W = list(norm_ops.values())[0].shape[2:]
+    device = list(norm_ops.values())[0].device
+
+    combined = torch.zeros(B, 1, H, W, device=device)
+
+    # 8个抽象算子的梯度
+    for name, op in norm_ops.items():
+        gx = F.conv2d(op, sobel_x, padding=1)
+        gy = F.conv2d(op, sobel_y, padding=1)
+        grad = torch.sqrt(gx**2 + gy**2 + 1e-8)
+        combined = torch.max(combined, grad)
+
+    # 表象层的梯度（如果有）
+    if appearance_field is not None:
+        for c in range(appearance_field.shape[1]):
+            ch = appearance_field[:, c:c+1]
+            gx = F.conv2d(ch, sobel_x, padding=1)
+            gy = F.conv2d(ch, sobel_y, padding=1)
+            grad = torch.sqrt(gx**2 + gy**2 + 1e-8)
+            combined = torch.max(combined, grad)
+
+    # 归一化 + 闭运算填充薄缝
+    combined = robust_normalize(combined)
     if close_radius > 0:
-        B, C, H, W = edge.shape
         ks = 2 * close_radius + 1
-        # 膨胀（max pooling）
         dilated = F.max_pool2d(
-            F.pad(edge, [close_radius]*4, mode='reflect'),
-            ks, 1, 0)
-        # 腐蚀（-max_pool on negative）
+            F.pad(combined, [close_radius]*4, mode='reflect'), ks, 1, 0)
         eroded = -F.max_pool2d(
-            F.pad(-dilated, [close_radius]*4, mode='reflect'),
-            ks, 1, 0)
-        edge = eroded
+            F.pad(-dilated, [close_radius]*4, mode='reflect'), ks, 1, 0)
+        combined = eroded
 
-    return edge * edge_scale
+    return combined * edge_scale
 
 
 # ═══════════════════════════════════════════════════════════
@@ -325,8 +339,10 @@ def essence_field_compute(x, pipe, presmooth_sigma=3.0, edge_scale=5.0,
 
     field = torch.cat(fields, dim=1)
 
-    # 边缘度规（抽象层算子计算，不受其他层影响）
-    edge_metric = compute_edge_metric(norm_ops, edge_scale, close_radius=2)
+    # 联合边缘度规 = 表象梯度 + 抽象算子梯度
+    appearance_for_edge = appearance_features(x) if use_appearance else None
+    edge_metric = compute_essence_edge(norm_ops, appearance_for_edge,
+                                        edge_scale, close_radius=2)
 
     return field, edge_metric, norm_ops
 
@@ -385,19 +401,21 @@ def edge_aware_diffusion(field, edge_metric, n_iters=20, alpha=0.2):
 
 def field_to_materials(field_8, edge_metric=None, n_clusters=None):
     """
-    从本质场提取物质。
+    从本质场提取物质——稳定态连通分量（替换 K-means）。
 
-    先边缘感知扩散，再聚类。
+    先边缘感知扩散，再找场的"盆地"（稳定态），
+    每个盆地 = 一种物质。不需要指定 K。
 
     Args:
-        field_8: [B, D, H, W] 本质向量场（D=8 或 D=14）
-        edge_metric: [B, 1, H, W] 边缘度规（None = 用均匀度规）
-        n_clusters: 聚类数（None = 自动）
+        field_8: [B, D, H, W] 本质向量场
+        edge_metric: [B, 1, H, W] 边缘度规
+        n_clusters: 忽略（保留兼容性）
 
     Returns:
         labels: [H, W] 物质标签
-        field_smoothed: [B, 8, H, W] 扩散后场
+        field_smoothed: [B, D, H, W] 扩散后场
         convergence: list[float]
+        prototypes: [K, D] 物质原型向量
     """
     # 扩散
     if edge_metric is None:
@@ -405,45 +423,85 @@ def field_to_materials(field_8, edge_metric=None, n_clusters=None):
                                   device=field_8.device)
     field_smooth, convergence = edge_aware_diffusion(field_8, edge_metric)
 
-    # 转 numpy 做聚类
     C = field_smooth.shape[1]
-    vec = field_smooth[0].permute(1, 2, 0).reshape(-1, C).detach().cpu().numpy()
     H, W = field_8.shape[2], field_8.shape[3]
-    N = H * W
+    field_np = field_smooth[0].detach().cpu().numpy()  # [C, H, W]
+    edge_np = edge_metric[0, 0].detach().cpu().numpy()
 
-    # L2 归一化算子向量
-    vec_norm = vec / (np.linalg.norm(vec, axis=1, keepdims=True) + 1e-8)
+    # ---- Step 1: 计算场的局部梯度（场变化幅度）----
+    grad_y = np.abs(np.diff(field_np, axis=1, append=field_np[:, -1:, :]))
+    grad_x = np.abs(np.diff(field_np, axis=2, append=field_np[:, :, -1:]))
+    field_grad = np.sqrt(np.mean(grad_y**2 + grad_x**2, axis=0))  # [H, W]
 
-    # 添加空间坐标 → 空间邻近也影响聚类归属
-    ys, xs = np.mgrid[0:H, 0:W]
-    ys_norm = ys.flatten() / H  # [0, 1]
-    xs_norm = xs.flatten() / W  # [0, 1]
-    # 空间权重：相邻像素空间距离小 → 更容易归同簇
-    spatial_weight = 0.3  # 空间 vs 算子的权重比（越大越重视空间邻近）
-    vec_spatial = np.column_stack([
-        vec_norm,
-        xs_norm * spatial_weight,
-        ys_norm * spatial_weight,
-    ])  # [N, 10]
+    # ---- Step 2: 找盆地中心——场梯度极小 + 远离边缘 ----
+    from scipy import ndimage
+    from skimage.feature import peak_local_max
 
-    from sklearn.cluster import KMeans
-    if n_clusters is None:
-        inertias = []
-        for k in range(2, 9):
-            km = KMeans(n_clusters=k, random_state=42, n_init=10)
-            km.fit(vec_spatial)
-            inertias.append(km.inertia_)
-        curves = [inertias[i-1] - 2*inertias[i] + inertias[i+1]
-                  for i in range(1, len(inertias)-1)]
-        best_k = 2 + np.argmax(np.abs(curves))
-    else:
-        best_k = n_clusters
+    # 盆地高程 = 场梯度 + 边缘度规
+    elevation = field_grad + edge_np * 1.5
+    elevation = ndimage.gaussian_filter(elevation, sigma=6.0)
 
-    km = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-    labels = km.fit_predict(vec_spatial)
-    labels = labels.reshape(H, W)
+    # 找局部极小值 = 物质中心
+    minima = peak_local_max(
+        -elevation,  # 反转 → 盆地底 = 峰
+        min_distance=25,
+        threshold_abs=-np.percentile(elevation, 35),
+        exclude_border=True,
+        num_peaks=8)
 
-    return labels, field_smooth, convergence, km.cluster_centers_[:, :8]
+    if len(minima) <= 1:
+        # 找不到足够盆地 → 回退到单个物质
+        labels = np.zeros((H, W), dtype=int)
+        prototypes = np.array([field_np.mean(axis=(1, 2))])
+        return labels, field_smooth, convergence, prototypes
+
+    # ---- Step 3: 流域分割 ----
+    from skimage.segmentation import watershed
+    markers = np.zeros((H, W), dtype=int)
+    for i, (y, x) in enumerate(minima):
+        markers[y, x] = i + 1
+
+    labels = watershed(elevation, markers)
+
+    # ---- Step 4: 合并小区域 ----
+    min_size = H * W // 30  # 最小3%面积
+    n_labels = labels.max()
+    new_labels = np.zeros_like(labels)
+    next_id = 1
+    prototypes_list = []
+
+    for lid in range(1, n_labels + 1):
+        mask = labels == lid
+        if mask.sum() >= min_size:
+            new_labels[mask] = next_id
+            prototypes_list.append(field_np[:, mask].mean(axis=1))
+            next_id += 1
+
+    if next_id == 1:
+        labels = np.zeros((H, W), dtype=int)
+        prototypes = np.array([field_np.mean(axis=(1, 2))])
+        return labels, field_smooth, convergence, prototypes
+
+    labels = new_labels
+    prototypes = np.array(prototypes_list)  # [K, C]
+    n_materials = next_id - 1
+
+    # ---- Step 5: 填充未标记像素 ----
+    unlabeled = labels == 0
+    if unlabeled.any():
+        from scipy.spatial import KDTree
+        lys, lxs = np.where(~unlabeled)
+        lvals = labels[~unlabeled]
+        tree = KDTree(np.column_stack([lys, lxs]))
+        uys, uxs = np.where(unlabeled)
+        _, nearest = tree.query(np.column_stack([uys, uxs]))
+        labels[uys, uxs] = lvals[nearest]
+
+    # 标签从0开始
+    labels = labels - 1
+    labels = labels.clip(min=0)
+
+    return labels, field_smooth, convergence, prototypes
 
 
 def describe_material(labels, field_8, operator_names=None):
