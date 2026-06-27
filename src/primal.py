@@ -27,8 +27,9 @@ def auto_parameters(field):
         nb = torch.roll(field, shifts=(dy, dx), dims=(2, 3))
         d = (field - nb).pow(2).sum(dim=1).sqrt().mean()
         diffs.append(d.item())
-    tau = sorted(diffs)[len(diffs) // 2] * 0.5
-    tau = max(0.005, min(0.2, tau))  # clamp reasonable range
+    dim_factor = C ** 0.5  # 高维距离自然更大 → tau 按√C 缩放
+    tau = sorted(diffs)[len(diffs) // 2] / dim_factor
+    tau = max(0.005, min(0.2, tau))
 
     # alpha: 边缘密度越高 → 步长越小
     grad_y = (field[:, :, 1:, :] - field[:, :, :-1, :]).abs().mean()
@@ -42,37 +43,27 @@ def auto_parameters(field):
 
 def enrich_field(rgb_field):
     """
-    RGB(3) -> RGB + structure = 8-dim primal vector.
+    像素能提供什么就放什么。人不做选择。
 
-    ch0-2: R,G,B (color face)
-    ch3-6: up/down/left/right neighbor diff (structure face)
-    ch7:   5x5 local variance (texture face)
+    信息源1: 自己的值 RGB(3)
+    信息源2: 和4邻域的关系 4方向×3通道差异(12)
+    总共: 15 维
 
-    Structure not named — naming is human's job after emergence.
+    不命名维度。不选择"加哪个好"。场的弛豫自己决定。
     """
     B, C, H, W = rgb_field.shape
-    device = rgb_field.device
 
-    # Color face
-    rgb = rgb_field
+    # 自己的值: RGB
+    parts = [rgb_field]
 
-    # Structure face: 4-direction neighbor diffs
-    diffs = []
+    # 和邻域的关系: 每个方向，每个通道的差异
     for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
         nb = torch.roll(rgb_field, shifts=(dy, dx), dims=(2, 3))
-        diff = (rgb_field - nb).abs().mean(dim=1, keepdim=True)
-        diffs.append(diff)
-    structure = torch.cat(diffs, dim=1)  # [B, 4, H, W]
+        diff = rgb_field - nb  # [B, 3, H, W] — per-channel difference
+        parts.append(diff)
 
-    # Texture face: 5x5 local variance (avg over RGB channels)
-    kernel = torch.ones(1, 1, 5, 5, device=device) / 25
-    gray = rgb.mean(dim=1, keepdim=True)  # [B, 1, H, W]
-    local_mean = F.conv2d(gray, kernel, padding=2)
-    local_sq_mean = F.conv2d(gray * gray, kernel, padding=2)
-    local_var = (local_sq_mean - local_mean * local_mean).clamp(min=0)
-
-    # Concat: color(3) + structure(4) + texture(1) = 8-dim
-    return torch.cat([rgb, structure, local_var], dim=1)
+    # 15维: 3 (self) + 3×4 (relations) = 15
+    return torch.cat(parts, dim=1)
 
 
 def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
