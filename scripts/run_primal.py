@@ -19,7 +19,7 @@ from src.primal import primal_relax, extract_domains
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-def run(img_path, tau=0.02, alpha=0.3, n_iters=50):
+def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0):
     img = cv2.imread(img_path)
     if img is None:
         print(f'Cannot read: {img_path}')
@@ -29,8 +29,9 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50):
     img_small = cv2.resize(img_rgb, (128, 128))
     x = torch.from_numpy(img_small).permute(2, 0, 1).float().unsqueeze(0).to(DEVICE) / 255.
 
-    # 唯一规则: RGB场 → 邻域相似度驱动演化
-    field, conv = primal_relax(x, tau=tau, alpha=alpha, n_iters=n_iters)
+    # 场弛豫: 吸引 + 排斥
+    field, conv = primal_relax(x, tau=tau, alpha=alpha, n_iters=n_iters,
+                               repulsion=repulsion)
     labels, n_domains = extract_domains(field)
 
     # 多色分割
@@ -75,5 +76,6 @@ if __name__ == '__main__':
     parser.add_argument('--tau', type=float, default=0.02, help='温度(越小越挑剔)')
     parser.add_argument('--alpha', type=float, default=0.3, help='步长')
     parser.add_argument('--iters', type=int, default=50, help='最大迭代数')
+    parser.add_argument('--repulsion', type=float, default=0.0, help='排斥强度 [0,1)')
     args = parser.parse_args()
-    run(args.image, args.tau, args.alpha, args.iters)
+    run(args.image, args.tau, args.alpha, args.iters, args.repulsion)

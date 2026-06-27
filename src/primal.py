@@ -15,21 +15,19 @@ import torch
 import numpy as np
 
 
-def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50):
+def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
     """
-    单一规则场弛豫。
+    场弛豫。规则：吸引 + 排斥。
 
-    每个像素向其邻居加权移动。权重=相似度。
+    吸引: 相似邻居 → 拉近
+    排斥: 不相似邻居 → 推开 (repulsion>0时启用)
 
     Args:
-        field: [B, C, H, W] 初始场向量（如RGB）
-        tau: 温度。越小→只吸引极相似邻居
+        field: [B, C, H, W] 初始场向量
+        tau: 温度
         alpha: 步长
         n_iters: 最大迭代数
-
-    Returns:
-        field_relaxed: [B, C, H, W] 弛豫后场
-        convergence: list[float] 每轮变化量
+        repulsion: 排斥强度 [0,1)。0=纯吸引
     """
     B, C, H, W = field.shape
     phi = field.clone()
@@ -38,18 +36,34 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50):
     for _ in range(n_iters):
         prev = phi.clone()
 
-        # 4邻域加权平均
-        new = torch.zeros_like(phi)
-        wsum = torch.zeros(B, 1, H, W, device=field.device)
+        attract = torch.zeros_like(phi)
+        awsum = torch.zeros(B, 1, H, W, device=field.device)
+        repel = torch.zeros_like(phi)
+        rwsum = torch.zeros(B, 1, H, W, device=field.device)
 
         for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
             nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
             diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
             sim = torch.exp(-diff / tau)
-            new += nb * sim
-            wsum += sim
 
-        phi_new = new / (wsum + 1e-8)
+            # 吸引: 相似邻居加权
+            attract += nb * sim
+            awsum += sim
+
+            # 排斥: 不相似邻居推远
+            if repulsion > 0:
+                push = (phi - nb) * (1.0 - sim)
+                repel += push
+                rwsum += (1.0 - sim)
+
+        phi_attract = attract / (awsum + 1e-8)
+
+        if repulsion > 0:
+            phi_repel = phi + repel / (rwsum + 1e-8)
+            phi_new = phi_attract * (1 - repulsion) + phi_repel * repulsion
+        else:
+            phi_new = phi_attract
+
         phi = (1 - alpha) * phi + alpha * phi_new
 
         d = (phi - prev).norm() / (phi.norm() + 1e-8)
