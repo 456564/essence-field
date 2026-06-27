@@ -16,12 +16,13 @@ plt.rcParams['axes.unicode_minus'] = False
 
 from src.primal import (primal_relax, primal_relax_multiscale,
                        extract_domains, enrich_field)
+from src.primal_renorm import primal_relax_renorm
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def run(img_path, alpha=0.3, n_iters=50, repulsion=False,
-        multiscale=False, inertia=False, enrich=False):
+        multiscale=False, inertia=False, enrich=False, renorm=False):
     img = cv2.imread(img_path)
     if img is None:
         print(f'Cannot read: {img_path}')
@@ -35,7 +36,10 @@ def run(img_path, alpha=0.3, n_iters=50, repulsion=False,
     x = enrich_field(x_rgb) if enrich else x_rgb
 
     # 场弛豫
-    if multiscale:
+    if renorm:
+        field, conv, net_force = primal_relax_renorm(
+            x, alpha=alpha, n_iters=n_iters, repulsion=repulsion)
+    elif multiscale:
         field, conv, net_force = primal_relax_multiscale(
             x, alpha=alpha, n_iters=n_iters, repulsion=repulsion)
     else:
@@ -86,6 +90,7 @@ if __name__ == '__main__':
     parser.add_argument('--multiscale', action='store_true', help='启用多尺度')
     parser.add_argument('--inertia', action='store_true', help='启用惯性')
     parser.add_argument('--enrich', action='store_true', help='丰富基元向量(RGB→8维)')
+    parser.add_argument('--renorm', action='store_true', help='重整化(共识粗化)')
     args = parser.parse_args()
     run(args.image, args.alpha, args.iters, args.repulsion,
-        args.multiscale, args.inertia, args.enrich)
+        args.multiscale, args.inertia, args.enrich, args.renorm)
