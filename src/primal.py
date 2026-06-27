@@ -15,21 +15,22 @@ import torch
 import numpy as np
 
 
-def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50):
+def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50,
+                 repulsion=0.0):
     """
-    单一规则场弛豫。
+    场弛豫——吸引+排斥。
 
-    每个像素向其邻居加权移动。权重=相似度。
+    规则: 相似→吸引(拉近)。不相似→排斥(推开)。
 
     Args:
-        field: [B, C, H, W] 初始场向量（如RGB）
+        field: [B, C, H, W] 初始场向量
         tau: 温度。越小→只吸引极相似邻居
         alpha: 步长
         n_iters: 最大迭代数
+        repulsion: 排斥强度 [0, 1)。0=无排斥, 越大越排斥不相似邻居
 
     Returns:
-        field_relaxed: [B, C, H, W] 弛豫后场
-        convergence: list[float] 每轮变化量
+        field_relaxed, convergence
     """
     B, C, H, W = field.shape
     phi = field.clone()
@@ -38,18 +39,39 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50):
     for _ in range(n_iters):
         prev = phi.clone()
 
-        # 4邻域加权平均
-        new = torch.zeros_like(phi)
-        wsum = torch.zeros(B, 1, H, W, device=field.device)
+        # ---- 吸引: 相似邻居拉向我 ----
+        attract = torch.zeros_like(phi)
+        awsum = torch.zeros(B, 1, H, W, device=field.device)
+
+        # ---- 排斥: 不相似邻居推开我 ----
+        repel = torch.zeros_like(phi)
+        rwsum = torch.zeros(B, 1, H, W, device=field.device)
 
         for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
             nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
             diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
-            sim = torch.exp(-diff / tau)
-            new += nb * sim
-            wsum += sim
+            sim = torch.exp(-diff / tau)  # [0, 1]
 
-        phi_new = new / (wsum + 1e-8)
+            # 吸引: 相似度 × 邻居向量
+            attract += nb * sim
+            awsum += sim
+
+            # 排斥: 反向力 = 不相似度 × (我 - 邻居)方向
+            #        不相似 → 邻居和我差异大 → 推我远离它
+            if repulsion > 0:
+                dissimilarity = 1.0 - sim  # [0, 1]
+                push = (phi - nb) * dissimilarity  # 推开方向
+                repel += push
+                rwsum += dissimilarity
+
+        # 吸引: 加权平均
+        phi_attract = attract / (awsum + 1e-8)
+
+        # 排斥: 远离不相似邻居
+        phi_repel = phi + repel / (rwsum + 1e-8) if repulsion > 0 else phi
+
+        # 合力
+        phi_new = phi_attract * (1 - repulsion) + phi_repel * repulsion
         phi = (1 - alpha) * phi + alpha * phi_new
 
         d = (phi - prev).norm() / (phi.norm() + 1e-8)
