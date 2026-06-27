@@ -439,15 +439,15 @@ def field_to_materials(field_8, edge_metric=None, n_clusters=None):
 
     # 盆地高程 = 场梯度 + 边缘度规
     elevation = field_grad + edge_np * 1.5
-    elevation = ndimage.gaussian_filter(elevation, sigma=6.0)
+    elevation = ndimage.gaussian_filter(elevation, sigma=7.0)
 
     # 找局部极小值 = 物质中心
     minima = peak_local_max(
         -elevation,  # 反转 → 盆地底 = 峰
-        min_distance=25,
-        threshold_abs=-np.percentile(elevation, 35),
+        min_distance=30,
+        threshold_abs=-np.percentile(elevation, 40),
         exclude_border=True,
-        num_peaks=8)
+        num_peaks=6)
 
     if len(minima) <= 1:
         # 找不到足够盆地 → 回退到单个物质
@@ -463,32 +463,50 @@ def field_to_materials(field_8, edge_metric=None, n_clusters=None):
 
     labels = watershed(elevation, markers)
 
-    # ---- Step 4: 合并小区域 ----
-    min_size = H * W // 30  # 最小3%面积
+    # ---- Step 4: 合并小区域 → 最近大邻居 ----
+    min_size = H * W // 20  # 最小~5%面积
     n_labels = labels.max()
-    new_labels = np.zeros_like(labels)
-    next_id = 1
+    # 先标记大小
+    sizes = {lid: (labels == lid).sum() for lid in range(1, n_labels + 1)}
+    big_labels = {lid for lid, sz in sizes.items() if sz >= min_size}
+
+    # 小区域像素重新分配给最近的大区域
+    if big_labels:
+        from scipy.spatial import KDTree
+        # 大区域的坐标
+        big_mask = np.isin(labels, list(big_labels))
+        big_ys, big_xs = np.where(big_mask)
+        big_vals = labels[big_mask]
+        tree = KDTree(np.column_stack([big_ys, big_xs]))
+
+        # 小区域坐标
+        small_mask = ~big_mask & (labels > 0)
+        if small_mask.any():
+            small_ys, small_xs = np.where(small_mask)
+            _, nearest = tree.query(np.column_stack([small_ys, small_xs]))
+            labels[small_ys, small_xs] = big_vals[nearest]
+
+    # 重新标签为 0, 1, 2, ...
+    unique = sorted(set(labels[labels > 0]))
+    final_labels = np.zeros_like(labels)
     prototypes_list = []
+    for new_id, old_id in enumerate(unique, 1):
+        mask = labels == old_id
+        final_labels[mask] = new_id
+        prototypes_list.append(field_np[:, mask].mean(axis=1))
 
-    for lid in range(1, n_labels + 1):
-        mask = labels == lid
-        if mask.sum() >= min_size:
-            new_labels[mask] = next_id
-            prototypes_list.append(field_np[:, mask].mean(axis=1))
-            next_id += 1
-
-    if next_id == 1:
+    if not prototypes_list:
         labels = np.zeros((H, W), dtype=int)
         prototypes = np.array([field_np.mean(axis=(1, 2))])
         return labels, field_smooth, convergence, prototypes
 
-    labels = new_labels
-    prototypes = np.array(prototypes_list)  # [K, C]
-    n_materials = next_id - 1
+    labels = final_labels
+    prototypes = np.array(prototypes_list)
+    n_materials = len(unique)
 
     # ---- Step 5: 填充未标记像素 ----
     unlabeled = labels == 0
-    if unlabeled.any():
+    if unlabeled.any() and n_materials > 0:
         from scipy.spatial import KDTree
         lys, lxs = np.where(~unlabeled)
         lvals = labels[~unlabeled]
@@ -497,9 +515,8 @@ def field_to_materials(field_8, edge_metric=None, n_clusters=None):
         _, nearest = tree.query(np.column_stack([uys, uxs]))
         labels[uys, uxs] = lvals[nearest]
 
-    # 标签从0开始
-    labels = labels - 1
-    labels = labels.clip(min=0)
+    # 确保 0-indexed
+    labels = labels.clip(min=1) - 1
 
     return labels, field_smooth, convergence, prototypes
 
