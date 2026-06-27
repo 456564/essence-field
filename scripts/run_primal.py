@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-from src.primal import primal_relax, primal_relax_full, extract_domains, enrich_field
+from src.primal import (primal_relax, primal_relax_full, extract_domains,
+                       enrich_field, auto_parameters)
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -39,6 +40,13 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, flags=8):
 
     # 丰富基元向量: RGB(3) → RGB+结构+纹理(8)
     x_enriched = enrich_field(x)
+
+    # 自动参数: 从图像统计量推导（tau=0 则用手动值）
+    auto_tau, auto_alpha = auto_parameters(x_enriched)
+    if tau <= 0:
+        tau = auto_tau
+    if alpha <= 0:
+        alpha = auto_alpha
 
     # 解析组合
     use_att, use_rep, use_ms, use_inert = parse_flags(flags)
@@ -84,7 +92,7 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, flags=8):
     plt.tight_layout(); plt.savefig(out, dpi=120); plt.close()
 
     areas = [(labels == k).sum() / (128 * 128) * 100 for k in range(n_domains)]
-    print(f'Image: {H}x{W}  |  Primal field: {len(conv)} iters')
+    print(f'Image: {H}x{W}  |  Auto tau={tau:.4f} alpha={alpha:.3f}  |  {len(conv)} iters')
     print(f'Domains: {n_domains}')
     for k in sorted(range(n_domains), key=lambda i: -areas[i]):
         print(f'  M{k+1}: {areas[k]:.0f}%')
@@ -95,8 +103,8 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Primal Field')
     parser.add_argument('image', help='图片路径')
-    parser.add_argument('--tau', type=float, default=0.02, help='温度(越小越挑剔)')
-    parser.add_argument('--alpha', type=float, default=0.3, help='步长')
+    parser.add_argument('--tau', type=float, default=0.0, help='温度(0=自动)')
+    parser.add_argument('--alpha', type=float, default=0.0, help='步长(0=自动)')
     parser.add_argument('--iters', type=int, default=50, help='最大迭代数(仅安全上限，收敛自动停)')
     parser.add_argument('--repulsion', type=float, default=0.0, help='(legacy)')
     parser.add_argument('--rule', type=int, default=0, help='(legacy)')

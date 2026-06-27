@@ -12,6 +12,34 @@ import torch.nn.functional as F
 import numpy as np
 
 
+def auto_parameters(field):
+    """
+    从图像统计量自动推导交互参数。零人为设定。
+
+    tau (温度): 中位数邻域差异 → 图像自身定义"多近算近"
+    alpha (步长): 边缘密度的函数 → 复杂图慢走，简单图快走
+    """
+    B, C, H, W = field.shape
+
+    # tau: 4方向邻域差异的中位数
+    diffs = []
+    for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+        nb = torch.roll(field, shifts=(dy, dx), dims=(2, 3))
+        d = (field - nb).pow(2).sum(dim=1).sqrt().mean()
+        diffs.append(d.item())
+    tau = sorted(diffs)[len(diffs) // 2] * 0.5
+    tau = max(0.005, min(0.2, tau))  # clamp reasonable range
+
+    # alpha: 边缘密度越高 → 步长越小
+    grad_y = (field[:, :, 1:, :] - field[:, :, :-1, :]).abs().mean()
+    grad_x = (field[:, :, :, 1:] - field[:, :, :, :-1]).abs().mean()
+    edge_density = ((grad_y + grad_x) / 2).item()
+    alpha = 0.15 + 0.25 * (1.0 - min(edge_density, 1.0))
+    alpha = max(0.1, min(0.5, alpha))
+
+    return tau, alpha
+
+
 def enrich_field(rgb_field):
     """
     RGB(3) -> RGB + structure = 8-dim primal vector.
