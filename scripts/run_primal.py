@@ -14,12 +14,20 @@ import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-from src.primal import primal_relax, extract_domains
+from src.primal import (primal_relax, primal_relax_multiscale,
+                       primal_relax_inertia, extract_domains)
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+RELAX_FNS = {
+    1: primal_relax,                  # 纯吸引
+    2: primal_relax,                  # 吸引 + 排斥
+    3: primal_relax_multiscale,       # 吸引 + 多尺度
+    4: primal_relax_inertia,          # 吸引 + 惯性
+}
 
-def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0):
+
+def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0, rule=1):
     img = cv2.imread(img_path)
     if img is None:
         print(f'Cannot read: {img_path}')
@@ -29,8 +37,9 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0):
     img_small = cv2.resize(img_rgb, (128, 128))
     x = torch.from_numpy(img_small).permute(2, 0, 1).float().unsqueeze(0).to(DEVICE) / 255.
 
-    # 交互法则: 吸引 + 排斥
-    field, conv = primal_relax(x, tau=tau, alpha=alpha, n_iters=n_iters, repulsion=repulsion)
+    # 选规则
+    relax_fn = RELAX_FNS[rule]
+    field, conv = relax_fn(x, tau=tau, alpha=alpha, n_iters=n_iters, repulsion=repulsion)
     labels, n_domains = extract_domains(field)
 
     # 多色分割
@@ -57,7 +66,7 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0):
     axes[3].imshow(overlay); axes[3].set_title(f'{n_domains} Domains'); axes[3].axis('off')
 
     name = os.path.splitext(os.path.basename(img_path))[0]
-    out = f'test_output/primal_{name}.png'
+    out = f'test_output/primal_r{rule}_{name}.png'
     plt.tight_layout(); plt.savefig(out, dpi=120); plt.close()
 
     areas = [(labels == k).sum() / (128 * 128) * 100 for k in range(n_domains)]
@@ -76,5 +85,7 @@ if __name__ == '__main__':
     parser.add_argument('--alpha', type=float, default=0.3, help='步长')
     parser.add_argument('--iters', type=int, default=50, help='最大迭代数')
     parser.add_argument('--repulsion', type=float, default=0.0, help='排斥强度 [0,1)')
+    parser.add_argument('--rule', type=int, default=1, choices=[1,2,3,4],
+                        help='规则: 1=吸引 2=+排斥 3=+多尺度 4=+惯性')
     args = parser.parse_args()
-    run(args.image, args.tau, args.alpha, args.iters, args.repulsion)
+    run(args.image, args.tau, args.alpha, args.iters, args.repulsion, args.rule)

@@ -82,6 +82,104 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50,
     return phi, conv
 
 
+def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
+                             repulsion=0.0, scales=2):
+    """
+    多尺度弛豫。规则3：不同空间频率用不同速率演化。
+
+    纹理(高频) → 原图尺度交互（快速）
+    轮廓(低频) → 降采样后交互 → 上采样回原图（慢速）
+
+    效果: 纹理不碎——因为粗尺度看不到纹理缝隙。
+          轮廓保持——因为粗尺度能跨越纹理的干扰看到大轮廓。
+    """
+    if scales <= 1:
+        return primal_relax(field, tau, alpha, n_iters, repulsion)
+
+    B, C, H, W = field.shape
+    phi = field.clone()
+
+    for _ in range(n_iters):
+        # 细尺度: 原图上的吸引+排斥（处理纹理）
+        phi, _conv = primal_relax(phi, tau=tau * 0.5, alpha=alpha * 0.5,
+                                   n_iters=1, repulsion=repulsion * 0.3)
+
+        # 粗尺度: 降采样 → 弛豫 → 上采样
+        coarse = torch.nn.functional.interpolate(phi, scale_factor=0.5,
+                                                  mode='bilinear')
+        coarse, _ = primal_relax(coarse, tau=tau * 2.0, alpha=alpha * 0.3,
+                                  n_iters=1, repulsion=repulsion * 0.7)
+        coarse_up = torch.nn.functional.interpolate(coarse, size=(H, W),
+                                                     mode='bilinear')
+
+        # 融合: 细尺度主导纹理，粗尺度引导轮廓
+        phi = phi * 0.7 + coarse_up * 0.3
+
+    return phi, [0.0]  # conv trivial for multi-scale wrapper
+
+
+def primal_relax_inertia(field, tau=0.05, alpha=0.3, n_iters=50,
+                         repulsion=0.0, inertia_decay=0.9):
+    """
+    惯性弛豫。规则4：已稳定区域抵抗变化。
+
+    追踪每个像素的历史变化量。
+    变化小 → 已稳定 → 步长衰减（抵抗新扰动）
+    变化大 → 未稳定 → 步长不变（继续演化）
+
+    Nature: 原子一旦成键 → 需要能量才能打破。
+    场:   像素一旦收敛 → 不应该被后续迭代轻易扰动。
+    """
+    B, C, H, W = field.shape
+    phi = field.clone()
+    conv = []
+
+    # 每像素的历史变化量（指数移动平均）
+    history = torch.zeros(B, 1, H, W, device=field.device)
+
+    for _ in range(n_iters):
+        prev = phi.clone()
+
+        # 吸引 + 排斥（同 primal_relax 逻辑）
+        attract = torch.zeros_like(phi)
+        awsum = torch.zeros(B, 1, H, W, device=field.device)
+        repel = torch.zeros_like(phi)
+        rwsum = torch.zeros(B, 1, H, W, device=field.device)
+
+        for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
+            diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
+            sim = torch.exp(-diff / tau)
+
+            attract += nb * sim
+            awsum += sim
+
+            if repulsion > 0:
+                push = (phi - nb) * (1.0 - sim)
+                repel += push
+                rwsum += (1.0 - sim)
+
+        phi_attract = attract / (awsum + 1e-8)
+        phi_repel = phi + repel / (rwsum + 1e-8) if repulsion > 0 else phi
+        phi_new = phi_attract * (1 - repulsion) + phi_repel * repulsion
+
+        # 当前变化量
+        change = (phi_new - phi).abs().mean(dim=1, keepdim=True)  # [B,1,H,W]
+        history = history * inertia_decay + change * (1 - inertia_decay)
+
+        # 自适应步长: 稳定区域(history小)→alpha衰减, 活跃区域→alpha不变
+        adaptive_alpha = alpha * (0.3 + 0.7 * (1.0 / (1.0 + history * 100)))
+
+        phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
+
+        d = (phi - prev).norm() / (phi.norm() + 1e-8)
+        conv.append(d.item())
+        if d < 1e-4:
+            break
+
+    return phi, conv
+
+
 def extract_domains(field_relaxed, grad_pct=75, min_domain_size=None):
     """
     从弛豫场中提取物质域。
