@@ -171,21 +171,55 @@ def primal_relax_full(field, tau=0.05, alpha=0.3, n_iters=50,
     return phi, conv
 
 
-def extract_domains(field_relaxed, grad_pct=75, min_domain_size=None):
-    """Extract material domains from relaxed field via field gradient."""
+def extract_domains(field_relaxed, grad_pct=None, min_domain_size=None):
+    """
+    物质域提取。grad_pct 自动推导（梯度直方图谷点）。
+    零人工参数。
+    """
     B, C, H, W = field_relaxed.shape
     field_np = field_relaxed[0].detach().cpu().numpy()
 
     gy = np.abs(np.diff(field_np, axis=1, append=field_np[:, -1:, :])).mean(0)
     gx = np.abs(np.diff(field_np, axis=2, append=field_np[:, :, -1:])).mean(0)
     grad = gy + gx
+
+    # 自动阈值：梯度直方图 Otsu 分割（内部 vs 边界）
+    if grad_pct is None:
+        grad_flat = grad.flatten()
+        # Otsu: maximize between-class variance
+        hist, bins = np.histogram(grad_flat, bins=128)
+        total = hist.sum()
+        best_t, best_var = 0, 0
+        sum_all = (hist * bins[:-1]).sum()
+        sum_b, w_b = 0, 0
+        for i in range(len(hist)):
+            w_b += hist[i]
+            if w_b == 0 or w_b == total:
+                continue
+            sum_b += hist[i] * bins[i]
+            w_f = total - w_b
+            sum_f = sum_all - sum_b
+            between = w_b * w_f * (sum_b / w_b - sum_f / w_f) ** 2
+            if between > best_var:
+                best_var = between
+                best_t = bins[i]
+        # 阈值 → 百分位
+        grad_pct = (grad_flat < best_t).mean() * 100
+        grad_pct = max(50, min(95, grad_pct))  # 钳制合理范围
+
     interior = grad < np.percentile(grad, grad_pct)
 
     from scipy import ndimage
     labels, n_raw = ndimage.label(interior)
 
+    # 自动 min_size: 初始域大小中位数的 1/5（碎片 = 远小于典型域）
     if min_domain_size is None:
-        min_domain_size = max(50, H * W // 100)
+        sizes_raw = ndimage.sum(np.ones_like(labels), labels,
+                                index=range(1, n_raw + 1))
+        if len(sizes_raw) > 0:
+            min_domain_size = max(20, int(np.median(sizes_raw) / 5))
+        else:
+            min_domain_size = 50
 
     sizes = ndimage.sum(np.ones_like(labels), labels, index=range(1, n_raw + 1))
     new_labels = np.zeros_like(labels)
