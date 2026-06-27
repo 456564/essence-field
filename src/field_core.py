@@ -323,6 +323,15 @@ def essence_field_compute(x, pipe, presmooth_sigma=3.0, edge_scale=5.0,
     if use_appearance:
         app = appearance_features(x)
         app = spatial_presmooth(app, presmooth_sigma)
+
+        # --- 跨层融合: 表象⊗抽象外积 → 48维 ---
+        B, _, H, W = app.shape
+        app_exp = app.unsqueeze(2)           # [B, 6, 1, H, W]
+        abs_exp = abstract_field.unsqueeze(1) # [B, 1, 8, H, W]
+        cross = (app_exp * abs_exp).reshape(B, 48, H, W)
+        cross = spatial_presmooth(cross, presmooth_sigma * 0.5)
+        fields.append(cross)
+        # 也保留原始表象（作为对比基准）
         fields.append(app)
 
     # --- 全局上下文层 (24维) ---
@@ -534,13 +543,19 @@ def describe_material(labels, field_8, operator_names=None):
     """
     C = field_8.shape[1]
     if operator_names is None:
-        if C >= 38:  # 抽象 + 表象 + 全局
+        if C >= 62:  # 抽象 + 交叉 + 表象 + 全局
+            operator_names = (
+                ['乾','坤','震','巽','坎','离','艮','兑'] +           # 0-7
+                [f'交{i}' for i in range(48)] +                       # 8-55 表象⊗抽象
+                ['亮对比','色相对比','纹理粗细','边缘密度','方向一致','高光'] # 56-61
+            )
+        elif C >= 38:  # 抽象 + 表象 + 全局
             operator_names = [
-                '乾','坤','震','巽','坎','离','艮','兑',           # 0-7  抽象
-                '亮对比','色相对比','纹理粗细','边缘密度','方向一致','高光', # 8-13 表象
-                '乾细','坤细','震细','巽细','坎细','离细','艮细','兑细',   # 14-21 多尺度细
-                '乾粗','坤粗','震粗','巽粗','坎粗','离粗','艮粗','兑粗',   # 22-29 多尺度粗
-                '乾环','坤环','震环','巽环','坎环','离环','艮环','兑环',   # 30-37 环绕
+                '乾','坤','震','巽','坎','离','艮','兑',
+                '亮对比','色相对比','纹理粗细','边缘密度','方向一致','高光',
+                '乾细','坤细','震细','巽细','坎细','离细','艮细','兑细',
+                '乾粗','坤粗','震粗','巽粗','坎粗','离粗','艮粗','兑粗',
+                '乾环','坤环','震环','巽环','坎环','离环','艮环','兑环',
             ]
         elif C == 14:
             operator_names = [
