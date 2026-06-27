@@ -87,18 +87,18 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
             # 记录每个方向的相似度（用于自适应排斥）
             all_sim[:, i] = sim[:, 0]
 
-            if repulsion > 0:
+            if repulsion:
                 push = (phi - nb) * (1.0 - sim)
                 repel += push
                 rwsum += (1.0 - sim)
 
         phi_attract = attract / (awsum + 1e-8)
 
-        if repulsion > 0:
-            # 自适应排斥强度: 邻域争议度 = 1 - 平均相似度
-            consensus = all_sim.mean(dim=1, keepdim=True)   # [B,1,H,W]
-            controversy = 1.0 - consensus                     # [B,1,H,W]
-            adaptive_rep = controversy * repulsion            # 上限 × 争议度
+        if repulsion:
+            # 争议度 × 耦合常数(0.2) = 排斥力。常数=物理定律，非人为调参。
+            consensus = all_sim.mean(dim=1, keepdim=True)
+            coupling = 0.2  # 排斥耦合常数——like fine-structure constant
+            adaptive_rep = (1.0 - consensus) * coupling
             phi_repel = phi + repel / (rwsum + 1e-8)
             phi_new = phi_attract * (1 - adaptive_rep) + phi_repel * adaptive_rep
         else:

@@ -20,7 +20,7 @@ from src.primal import (primal_relax, primal_relax_multiscale,
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0,
+def run(img_path, alpha=0.3, n_iters=50, repulsion=False,
         multiscale=False, inertia=False, enrich=False):
     img = cv2.imread(img_path)
     if img is None:
@@ -83,13 +83,12 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Primal Field')
     parser.add_argument('image', help='图片路径')
-    parser.add_argument('--tau', type=float, default=0.02, help='温度(越小越挑剔)')
     parser.add_argument('--alpha', type=float, default=0.3, help='步长')
     parser.add_argument('--iters', type=int, default=50, help='最大迭代数')
-    parser.add_argument('--repulsion', type=float, default=0.0, help='排斥强度 [0,1)')
+    parser.add_argument('--repulsion', action='store_true', help='启用排斥')
     parser.add_argument('--multiscale', action='store_true', help='启用多尺度')
     parser.add_argument('--inertia', action='store_true', help='启用惯性')
     parser.add_argument('--enrich', action='store_true', help='丰富基元向量(RGB→8维)')
     args = parser.parse_args()
-    run(args.image, args.tau, args.alpha, args.iters, args.repulsion,
+    run(args.image, args.alpha, args.iters, args.repulsion,
         args.multiscale, args.inertia, args.enrich)
