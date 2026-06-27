@@ -17,17 +17,12 @@ import numpy as np
 
 def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
     """
-    场弛豫。规则：吸引 + 排斥。
+    场弛豫。规则：吸引 + 自适应排斥。
 
-    吸引: 相似邻居 → 拉近
-    排斥: 不相似邻居 → 推开 (repulsion>0时启用)
+    自适应: 每个像素自己算邻域争议度。
+           争议大→强排斥(边界/缝隙)，争议小→弱排斥(平坦区)。
 
-    Args:
-        field: [B, C, H, W] 初始场向量
-        tau: 温度
-        alpha: 步长
-        n_iters: 最大迭代数
-        repulsion: 排斥强度 [0,1)。0=纯吸引
+    repulsion 参数是排斥力物理上限，非全局强度。
     """
     B, C, H, W = field.shape
     phi = field.clone()
@@ -40,17 +35,19 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
         awsum = torch.zeros(B, 1, H, W, device=field.device)
         repel = torch.zeros_like(phi)
         rwsum = torch.zeros(B, 1, H, W, device=field.device)
+        all_sim = torch.zeros(B, 4, H, W, device=field.device)
 
-        for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+        for i, (dy, dx) in enumerate([(0, 1), (0, -1), (1, 0), (-1, 0)]):
             nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
             diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
             sim = torch.exp(-diff / tau)
 
-            # 吸引: 相似邻居加权
             attract += nb * sim
             awsum += sim
 
-            # 排斥: 不相似邻居推远
+            # 记录每个方向的相似度（用于自适应排斥）
+            all_sim[:, i] = sim[:, 0]
+
             if repulsion > 0:
                 push = (phi - nb) * (1.0 - sim)
                 repel += push
@@ -59,8 +56,12 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
         phi_attract = attract / (awsum + 1e-8)
 
         if repulsion > 0:
+            # 自适应排斥强度: 邻域争议度 = 1 - 平均相似度
+            consensus = all_sim.mean(dim=1, keepdim=True)   # [B,1,H,W]
+            controversy = 1.0 - consensus                     # [B,1,H,W]
+            adaptive_rep = controversy * repulsion            # 上限 × 争议度
             phi_repel = phi + repel / (rwsum + 1e-8)
-            phi_new = phi_attract * (1 - repulsion) + phi_repel * repulsion
+            phi_new = phi_attract * (1 - adaptive_rep) + phi_repel * adaptive_rep
         else:
             phi_new = phi_attract
 
