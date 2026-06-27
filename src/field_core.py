@@ -442,28 +442,17 @@ def field_to_materials(field_8, edge_metric=None, n_clusters=None):
     grad_x = np.abs(np.diff(field_np, axis=2, append=field_np[:, :, -1:]))
     field_grad = np.sqrt(np.mean(grad_y**2 + grad_x**2, axis=0))  # [H, W]
 
-    # ---- Step 2: 自适应参数——复杂场景多峰，简单场景少峰 ----
+    # ---- Step 2: 先过分割 → 按盆地深度合并（像水自然沉淀） ----
     from scipy import ndimage
     from skimage.feature import peak_local_max
 
-    # 场梯度变异系数 → 图像复杂度
-    grad_cv = field_grad.std() / (field_grad.mean() + 1e-8)
-    # 自适应参数
-    if grad_cv > 1.5:       # 复杂（杂物桌面）
-        sigma_smooth = 5.0; min_dist = 20; num_peaks = 8
-    elif grad_cv > 0.8:     # 中等
-        sigma_smooth = 7.0; min_dist = 30; num_peaks = 6
-    elif grad_cv > 0.5:     # 简单（单物体+背景）
-        sigma_smooth = 5.0; min_dist = 18; num_peaks = 3
-    else:                    # 极简（均匀背景+小物体）
-        sigma_smooth = 3.0; min_dist = 15; num_peaks = 3
-
     elevation = field_grad + edge_np * 1.5
-    elevation = ndimage.gaussian_filter(elevation, sigma=sigma_smooth)
+    elevation = ndimage.gaussian_filter(elevation, sigma=4.0)
+    # 过量找峰——先细分，后面按自然深度合并
     minima = peak_local_max(
-        -elevation, min_distance=min_dist,
-        threshold_abs=-np.percentile(elevation, 40), exclude_border=True,
-        num_peaks=num_peaks)
+        -elevation, min_distance=20,
+        threshold_abs=-np.percentile(elevation, 50),
+        exclude_border=True, num_peaks=10)
 
     if len(minima) <= 1:
         # 找不到足够盆地 → 回退到单个物质
@@ -479,34 +468,34 @@ def field_to_materials(field_8, edge_metric=None, n_clusters=None):
 
     labels = watershed(elevation, markers)
 
-    # ---- Step 4: 合并小区域 → 最近大邻居 ----
-    min_size = H * W // 20  # 最小~5%面积
+    # ---- Step 4: 盆地深度合并——深=真物质，浅=噪声碎片 ----
     n_labels = labels.max()
-    # 先标记大小
-    sizes = {lid: (labels == lid).sum() for lid in range(1, n_labels + 1)}
-    big_labels = {lid for lid, sz in sizes.items() if sz >= min_size}
+    basin_depth = {lid: elevation[labels == lid].max() - elevation[labels == lid].min()
+                   for lid in range(1, n_labels + 1)}
+    max_depth = max(basin_depth.values())
+    deep = {lid for lid, d in basin_depth.items() if d >= max_depth * 0.25}
 
-    # 小区域像素重新分配给最近的大区域
-    if big_labels:
-        from scipy.spatial import KDTree
-        # 大区域的坐标
-        big_mask = np.isin(labels, list(big_labels))
-        big_ys, big_xs = np.where(big_mask)
-        big_vals = labels[big_mask]
-        tree = KDTree(np.column_stack([big_ys, big_xs]))
+    from scipy.ndimage import binary_dilation
+    merged = labels.copy()
+    for lid in sorted(range(1, n_labels + 1), key=lambda x: basin_depth[x]):
+        if lid in deep: continue
+        mask = labels == lid
+        border = binary_dilation(mask, iterations=1) & ~mask
+        neighbors = {n for n in set(labels[border]) if n not in (0, lid)}
+        if neighbors:
+            best = max(neighbors, key=lambda n: basin_depth.get(n, 0))
+            merged[merged == lid] = best
+            basin_depth[best] = max(basin_depth[best], basin_depth[lid])
 
-        # 小区域坐标
-        small_mask = ~big_mask & (labels > 0)
-        if small_mask.any():
-            small_ys, small_xs = np.where(small_mask)
-            _, nearest = tree.query(np.column_stack([small_ys, small_xs]))
-            labels[small_ys, small_xs] = big_vals[nearest]
+    labels = merged
+    for u, c in zip(*np.unique(labels, return_counts=True)):
+        if u > 0 and c < H * W // 200:
+            labels[labels == u] = 0
 
-    # 重新标签为 0, 1, 2, ...
-    unique = sorted(set(labels[labels > 0]))
+    final_unique = sorted(set(labels[labels > 0]))
     final_labels = np.zeros_like(labels)
     prototypes_list = []
-    for new_id, old_id in enumerate(unique, 1):
+    for new_id, old_id in enumerate(final_unique, 1):
         mask = labels == old_id
         final_labels[mask] = new_id
         prototypes_list.append(field_np[:, mask].mean(axis=1))
@@ -518,7 +507,7 @@ def field_to_materials(field_8, edge_metric=None, n_clusters=None):
 
     labels = final_labels
     prototypes = np.array(prototypes_list)
-    n_materials = len(unique)
+    n_materials = len(final_unique)
 
     # ---- Step 5: 填充未标记像素 ----
     unlabeled = labels == 0
