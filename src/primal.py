@@ -75,6 +75,46 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
     return phi, conv
 
 
+def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
+                              repulsion=0.0, coarse_weight=0.08):
+    """
+    多尺度弛豫。同一规则在粗细两个尺度上同时运行。
+
+    细尺度(原图): 处理纹理——快速局部演化
+    粗尺度(降采样): 处理轮廓——纹理被平均掉，只剩大结构
+
+    每轮迭代 = 细尺度一步 + 粗尺度一步 → 融合
+    """
+    B, C, H, W = field.shape
+    phi = field.clone()
+    conv = []
+
+    for _ in range(n_iters):
+        prev = phi.clone()
+
+        # 细尺度: 原图上的吸引+排斥（快速处理纹理）
+        phi, _c = primal_relax(phi, tau=tau * 0.5, alpha=alpha * 0.5,
+                                n_iters=1, repulsion=repulsion * 0.3)
+
+        # 粗尺度: 降采样 → 弛豫一步 → 上采样
+        coarse = torch.nn.functional.interpolate(
+            phi, scale_factor=0.5, mode='bilinear')
+        coarse, _ = primal_relax(coarse, tau=tau * 2.0, alpha=alpha * 0.3,
+                                  n_iters=1, repulsion=repulsion * 0.7)
+        coarse_up = torch.nn.functional.interpolate(
+            coarse, size=(H, W), mode='bilinear')
+
+        # 融合: 细尺度主导纹理，粗尺度引导轮廓
+        phi = phi * (1 - coarse_weight) + coarse_up * coarse_weight
+
+        d = (phi - prev).norm() / (phi.norm() + 1e-8)
+        conv.append(d.item())
+        if d < 1e-4:
+            break
+
+    return phi, conv
+
+
 def extract_domains(field_relaxed, grad_pct=75, min_domain_size=None):
     """
     从弛豫场中提取物质域。
