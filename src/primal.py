@@ -155,56 +155,48 @@ def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
 
 
 def primal_relax_inertia(field, tau=0.05, alpha=0.3, n_iters=50,
-                         repulsion=0.0, inertia_decay=0.9):
+                         inertia_gain=0.3):
     """
-    惯性弛豫。规则4：已稳定区域抵抗变化。
+    惯性弛豫。规则4：先稳定的区域抵抗后续变化。
 
-    追踪每个像素的历史变化量。
-    变化小 → 已稳定 → 步长衰减（抵抗新扰动）
-    变化大 → 未稳定 → 步长不变（继续演化）
+    物理定义: 越久没变的像素越难被扰动（=质量）。
+    不是"过去变化大不大"——是"多久没变了"。
 
-    Nature: 原子一旦成键 → 需要能量才能打破。
-    场:   像素一旦收敛 → 不应该被后续迭代轻易扰动。
+    实现: 连续稳定轮数计数器。变一次就清零。
+         稳定越久 → adaptive_alpha 越小 → 近乎冻结。
     """
     B, C, H, W = field.shape
     phi = field.clone()
     conv = []
 
-    # 每像素的历史变化量（指数移动平均）
-    history = torch.zeros(B, 1, H, W, device=field.device)
+    # 连续稳定计数器（非 EMA）
+    stability = torch.zeros(B, 1, H, W, device=field.device)
 
     for _ in range(n_iters):
         prev = phi.clone()
 
-        # 吸引 + 排斥（同 primal_relax 逻辑）
         attract = torch.zeros_like(phi)
         awsum = torch.zeros(B, 1, H, W, device=field.device)
-        repel = torch.zeros_like(phi)
-        rwsum = torch.zeros(B, 1, H, W, device=field.device)
 
         for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
             nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
             diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
             sim = torch.exp(-diff / tau)
-
             attract += nb * sim
             awsum += sim
 
-            if repulsion > 0:
-                push = (phi - nb) * (1.0 - sim)
-                repel += push
-                rwsum += (1.0 - sim)
+        phi_new = attract / (awsum + 1e-8)
 
-        phi_attract = attract / (awsum + 1e-8)
-        phi_repel = phi + repel / (rwsum + 1e-8) if repulsion > 0 else phi
-        phi_new = phi_attract * (1 - repulsion) + phi_repel * repulsion
+        # 每像素变化量
+        change = (phi_new - phi).abs().mean(dim=1, keepdim=True)
 
-        # 当前变化量
-        change = (phi_new - phi).abs().mean(dim=1, keepdim=True)  # [B,1,H,W]
-        history = history * inertia_decay + change * (1 - inertia_decay)
+        # 稳定计数器: 变化<阈值 → +1, 否则清零
+        is_stable = change < 0.001
+        stability = torch.where(is_stable, stability + 1,
+                                torch.zeros_like(stability))
 
-        # 自适应步长: 稳定区域(history小)→alpha衰减, 活跃区域→alpha不变
-        adaptive_alpha = alpha * (0.3 + 0.7 * (1.0 / (1.0 + history * 100)))
+        # 自适应步长: 稳定越久 → alpha 越小
+        adaptive_alpha = alpha / (1.0 + stability * inertia_gain)
 
         phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
 
@@ -237,7 +229,7 @@ def primal_relax_full(field, tau=0.05, alpha=0.3, n_iters=50,
     B, C, H, W = field.shape
     phi = field.clone()
     conv = []
-    history = torch.zeros(B, 1, H, W, device=field.device) if use_inertia else None
+    stability = torch.zeros(B, 1, H, W, device=field.device) if use_inertia else None
 
     for it in range(n_iters):
         prev = phi.clone()
@@ -278,11 +270,13 @@ def primal_relax_full(field, tau=0.05, alpha=0.3, n_iters=50,
                                                          mode='bilinear')
             phi_new = phi_new * (1 - coarse_weight) + coarse_up * coarse_weight
 
-        # ---- 惯性 ----
+        # ---- 惯性（连续稳定计数，非 EMA） ----
         if use_inertia:
             change = (phi_new - phi).abs().mean(dim=1, keepdim=True)
-            history = history * inertia_decay + change * (1 - inertia_decay)
-            adaptive_alpha = alpha * (0.3 + 0.7 / (1.0 + history * 100))
+            is_stable = change < 0.001
+            stability = torch.where(is_stable, stability + 1,
+                                    torch.zeros_like(stability))
+            adaptive_alpha = alpha / (1.0 + stability * 0.3)
         else:
             adaptive_alpha = alpha
 
