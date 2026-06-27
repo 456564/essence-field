@@ -62,6 +62,15 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0,
     for _ in range(n_iters):
         prev = phi.clone()
 
+        # 自适应 tau: 每像素 = base_tau × (1 + 局部方差 × scale)
+        kernel = torch.ones(1, 1, 5, 5, device=field.device) / 25
+        phi_flat = phi.reshape(B * C, 1, H, W)
+        local_mean = torch.nn.functional.conv2d(phi_flat, kernel, padding=2)
+        local_sq = torch.nn.functional.conv2d(phi_flat * phi_flat, kernel, padding=2)
+        local_var = (local_sq - local_mean * local_mean).clamp(min=0)
+        local_std = local_var.sqrt().reshape(B, C, H, W).mean(dim=1, keepdim=True)
+        adaptive_tau = tau * (1.0 + local_std * 10.0)
+
         attract = torch.zeros_like(phi)
         awsum = torch.zeros(B, 1, H, W, device=field.device)
         repel = torch.zeros_like(phi)
@@ -71,7 +80,7 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0,
         for i, (dy, dx) in enumerate([(0, 1), (0, -1), (1, 0), (-1, 0)]):
             nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
             diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
-            sim = torch.exp(-diff / tau)
+            sim = torch.exp(-diff / (adaptive_tau + 1e-8))
 
             attract += nb * sim
             awsum += sim
