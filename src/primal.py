@@ -96,7 +96,8 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
         if repulsion:
             consensus = all_sim.mean(dim=1, keepdim=True)
             coupling = grad_map * 0.5
-            adaptive_rep = (1.0 - consensus) * coupling
+            adaptive_rep = (1.0 - consensus + 0.02) * coupling
+            adaptive_rep = adaptive_rep.clamp(0, 0.5)
             phi_repel = phi + repel / (rwsum + 1e-8)
             phi_new = phi_attract * (1 - adaptive_rep) + phi_repel * adaptive_rep
         else:
