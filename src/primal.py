@@ -47,29 +47,27 @@ def enrich_field(rgb_field):
     return torch.cat(parts, dim=1)
 
 
-def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0,
+def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
                  inertia=False):
     """
-    场弛豫。规则：吸引 + 自适应排斥 + 惯性。
-
-    惯性: 连续稳定计数。稳定越久 → 步长越小 → 抗拒扰动。
+    场弛豫。tau 每像素自算——零全局常数。
     """
     B, C, H, W = field.shape
     phi = field.clone()
     conv = []
     stability = torch.zeros(B, 1, H, W, device=field.device) if inertia else None
 
+    # 每像素自己的 tau: 初始 4 邻域距离的中位数
+    diffs_init = []
+    for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+        nb = torch.roll(field, shifts=(dy, dx), dims=(2, 3))
+        d = (nb - field).pow(2).sum(dim=1, keepdim=True)
+        diffs_init.append(d)
+    tau_map = torch.stack(diffs_init).median(dim=0)[0]  # [B,1,H,W]
+    tau_map = tau_map.clamp(min=1e-6)
+
     for _ in range(n_iters):
         prev = phi.clone()
-
-        # 自适应 tau: 每像素 = base_tau × (1 + 局部方差 × scale)
-        kernel = torch.ones(1, 1, 5, 5, device=field.device) / 25
-        phi_flat = phi.reshape(B * C, 1, H, W)
-        local_mean = torch.nn.functional.conv2d(phi_flat, kernel, padding=2)
-        local_sq = torch.nn.functional.conv2d(phi_flat * phi_flat, kernel, padding=2)
-        local_var = (local_sq - local_mean * local_mean).clamp(min=0)
-        local_std = local_var.sqrt().reshape(B, C, H, W).mean(dim=1, keepdim=True)
-        adaptive_tau = tau * (1.0 + local_std * 10.0)
 
         attract = torch.zeros_like(phi)
         awsum = torch.zeros(B, 1, H, W, device=field.device)
@@ -80,7 +78,8 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0,
         for i, (dy, dx) in enumerate([(0, 1), (0, -1), (1, 0), (-1, 0)]):
             nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
             diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
-            sim = torch.exp(-diff / (adaptive_tau + 1e-8))
+            # 每像素自己的 tau —— 零全局常数
+            sim = torch.exp(-diff / tau_map)
 
             attract += nb * sim
             awsum += sim
@@ -125,7 +124,7 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0,
     return phi, conv
 
 
-def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
+def primal_relax_multiscale(field, alpha=0.3, n_iters=50,
                               repulsion=0.0, coarse_weight_max=0.15):
     """
     多尺度弛豫——每像素自适应。
@@ -141,13 +140,13 @@ def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
         prev = phi.clone()
 
         # 细尺度: 原图上的吸引+排斥
-        phi, _c = primal_relax(phi, tau=tau * 0.5, alpha=alpha * 0.5,
+        phi, _c = primal_relax(phi, alpha=alpha * 0.5,
                                 n_iters=1, repulsion=repulsion * 0.3)
 
         # 粗尺度: 降采样 → 弛豫 → 上采样
         coarse = torch.nn.functional.interpolate(
             phi, scale_factor=0.5, mode='bilinear')
-        coarse, _ = primal_relax(coarse, tau=tau * 2.0, alpha=alpha * 0.3,
+        coarse, _ = primal_relax(coarse, alpha=alpha * 0.3,
                                   n_iters=1, repulsion=repulsion * 0.7)
         coarse_up = torch.nn.functional.interpolate(
             coarse, size=(H, W), mode='bilinear')

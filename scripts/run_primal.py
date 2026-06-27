@@ -34,12 +34,12 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0,
     # 基元向量
     x = enrich_field(x_rgb) if enrich else x_rgb
 
-    # 场弛豫
+    # 场弛豫 (tau 每像素自算)
     if multiscale:
         field, conv = primal_relax_multiscale(
-            x, tau=tau, alpha=alpha, n_iters=n_iters, repulsion=repulsion)
+            x, alpha=alpha, n_iters=n_iters, repulsion=repulsion)
     else:
-        field, conv = primal_relax(x, tau=tau, alpha=alpha, n_iters=n_iters,
+        field, conv = primal_relax(x, alpha=alpha, n_iters=n_iters,
                                    repulsion=repulsion, inertia=inertia)
     labels, n_domains = extract_domains(field)
 
