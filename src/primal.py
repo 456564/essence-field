@@ -196,16 +196,10 @@ def extract_domains(field_relaxed, grad_pct=None, min_domain_size=None):
     gx = np.abs(np.diff(field_np, axis=2, append=field_np[:, :, -1:])).mean(0)
     grad = gy + gx
 
-    # 自动阈值：梯度累积能量肘点（不假设双峰分布）
+    # 边界灵敏度——观察者的固有属性，非图像参数
+    # 类比人眼对比度阈值：75% 像素判定为内部，25% 边界
     if grad_pct is None:
-        grad_flat = np.sort(grad.flatten())[::-1]  # 降序
-        cumsum = np.cumsum(grad_flat)
-        cumsum = cumsum / cumsum[-1]  # 归一化 [0,1]
-        # 肘点: 前N%的梯度贡献了50%的总能量 → N% = 边界比例
-        # 剩余(100-N)%贡献了另50% = 内部
-        knee_idx = np.searchsorted(cumsum, 0.5)
-        grad_pct = 100 - (knee_idx / len(grad_flat)) * 100
-        grad_pct = max(40, min(90, grad_pct))
+        grad_pct = 75
 
     interior = grad < np.percentile(grad, grad_pct)
 
