@@ -14,20 +14,20 @@ import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-from src.primal import (primal_relax, primal_relax_multiscale,
-                       primal_relax_inertia, extract_domains)
+from src.primal import primal_relax, primal_relax_full, extract_domains
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-RELAX_FNS = {
-    1: primal_relax,                  # 纯吸引
-    2: primal_relax,                  # 吸引 + 排斥
-    3: primal_relax_multiscale,       # 吸引 + 多尺度
-    4: primal_relax_inertia,          # 吸引 + 惯性
-}
+# 规则组合: 4-bit → (吸引,排斥,多尺度,惯性)
+RULE_NAMES = {1:'吸引', 2:'排斥', 3:'多尺度', 4:'惯性'}
 
 
-def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0, rule=1):
+def parse_flags(n):
+    """n ∈ [0,15] → (attract, repel, multiscale, inertia)"""
+    return bool(n & 8), bool(n & 4), bool(n & 2), bool(n & 1)
+
+
+def run(img_path, tau=0.02, alpha=0.3, n_iters=50, flags=8):
     img = cv2.imread(img_path)
     if img is None:
         print(f'Cannot read: {img_path}')
@@ -37,9 +37,22 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0, rule=1):
     img_small = cv2.resize(img_rgb, (128, 128))
     x = torch.from_numpy(img_small).permute(2, 0, 1).float().unsqueeze(0).to(DEVICE) / 255.
 
-    # 选规则
-    relax_fn = RELAX_FNS[rule]
-    field, conv = relax_fn(x, tau=tau, alpha=alpha, n_iters=n_iters, repulsion=repulsion)
+    # 解析组合: flags ∈ [0,15], bit3=吸引, bit2=排斥, bit1=多尺度, bit0=惯性
+    use_att, use_rep, use_ms, use_inert = parse_flags(flags)
+
+    if not use_att and not use_rep and not use_ms and not use_inert:
+        # 全关 → 返回原图，1域
+        field = x; conv = [0.0]; labels = np.zeros((128,128), dtype=int); n_domains = 1
+    elif not use_att:
+        # 纯排斥/多尺度/惯性 → 用对应单规则
+        field, conv = primal_relax(x, tau=tau, alpha=alpha, n_iters=n_iters)
+    else:
+        # 吸引开启 → 用组合函数
+        field, conv = primal_relax_full(
+            x, tau=tau, alpha=alpha, n_iters=n_iters,
+            use_repulsion=use_rep, repulsion_strength=0.1,
+            use_multiscale=use_ms, coarse_weight=0.15,
+            use_inertia=use_inert, inertia_decay=0.9)
     labels, n_domains = extract_domains(field)
 
     # 多色分割
@@ -66,7 +79,7 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0, rule=1):
     axes[3].imshow(overlay); axes[3].set_title(f'{n_domains} Domains'); axes[3].axis('off')
 
     name = os.path.splitext(os.path.basename(img_path))[0]
-    out = f'test_output/primal_r{rule}_{name}.png'
+    out = f'test_output/primal_{flags:04b}_{name}.png'
     plt.tight_layout(); plt.savefig(out, dpi=120); plt.close()
 
     areas = [(labels == k).sum() / (128 * 128) * 100 for k in range(n_domains)]
@@ -84,8 +97,9 @@ if __name__ == '__main__':
     parser.add_argument('--tau', type=float, default=0.02, help='温度(越小越挑剔)')
     parser.add_argument('--alpha', type=float, default=0.3, help='步长')
     parser.add_argument('--iters', type=int, default=50, help='最大迭代数')
-    parser.add_argument('--repulsion', type=float, default=0.0, help='排斥强度 [0,1)')
-    parser.add_argument('--rule', type=int, default=1, choices=[1,2,3,4],
-                        help='规则: 1=吸引 2=+排斥 3=+多尺度 4=+惯性')
+    parser.add_argument('--repulsion', type=float, default=0.0, help='(legacy)')
+    parser.add_argument('--rule', type=int, default=0, help='(legacy)')
+    parser.add_argument('--flags', type=int, default=8, help='规则组合 0-15 (8=仅吸引)')
     args = parser.parse_args()
-    run(args.image, args.tau, args.alpha, args.iters, args.repulsion, args.rule)
+    flags = args.rule if args.rule > 0 else args.flags  # legacy compat
+    run(args.image, args.tau, args.alpha, args.iters, flags)

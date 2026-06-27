@@ -82,6 +82,42 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50,
     return phi, conv
 
 
+def primal_relax_repulsion(field, tau=0.05, alpha=0.3, n_iters=50):
+    """
+    纯排斥——不相似邻居推动像素远离。
+
+    规则: 不相似 → 推开。相似 → 不影响。
+    和吸引相反：吸引是靠拢，排斥是推开。
+    """
+    B, C, H, W = field.shape
+    phi = field.clone()
+    conv = []
+
+    for _ in range(n_iters):
+        prev = phi.clone()
+        repel = torch.zeros_like(phi)
+        rwsum = torch.zeros(B, 1, H, W, device=field.device)
+
+        for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
+            diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
+            sim = torch.exp(-diff / tau)
+            # 不相似度 = 推开权重
+            push = (phi - nb) * (1.0 - sim)
+            repel += push
+            rwsum += (1.0 - sim)
+
+        phi_new = phi + repel / (rwsum + 1e-8)
+        phi = (1 - alpha) * phi + alpha * phi_new
+
+        d = (phi - prev).norm() / (phi.norm() + 1e-8)
+        conv.append(d.item())
+        if d < 1e-4:
+            break
+
+    return phi, conv
+
+
 def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
                              repulsion=0.0, scales=2):
     """
@@ -169,6 +205,86 @@ def primal_relax_inertia(field, tau=0.05, alpha=0.3, n_iters=50,
 
         # 自适应步长: 稳定区域(history小)→alpha衰减, 活跃区域→alpha不变
         adaptive_alpha = alpha * (0.3 + 0.7 * (1.0 / (1.0 + history * 100)))
+
+        phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
+
+        d = (phi - prev).norm() / (phi.norm() + 1e-8)
+        conv.append(d.item())
+        if d < 1e-4:
+            break
+
+    return phi, conv
+
+
+def primal_relax_full(field, tau=0.05, alpha=0.3, n_iters=50,
+                       use_repulsion=False, repulsion_strength=0.1,
+                       use_multiscale=False, coarse_weight=0.15,
+                       use_inertia=False, inertia_decay=0.9):
+    """
+    任意组合的场弛豫——四条规则自由开关。
+
+    Args:
+        use_repulsion: 启用排斥
+        repulsion_strength: 排斥力权重 [0,1)
+        use_multiscale: 启用多尺度
+        coarse_weight: 粗尺度融合权重
+        use_inertia: 启用惯性
+        inertia_decay: 历史衰减率
+    """
+    if not use_repulsion and not use_multiscale and not use_inertia:
+        return primal_relax(field, tau, alpha, n_iters)
+
+    B, C, H, W = field.shape
+    phi = field.clone()
+    conv = []
+    history = torch.zeros(B, 1, H, W, device=field.device) if use_inertia else None
+
+    for it in range(n_iters):
+        prev = phi.clone()
+
+        # ---- 吸引 + 排斥 ----
+        attract = torch.zeros_like(phi)
+        awsum = torch.zeros(B, 1, H, W, device=field.device)
+        repel = torch.zeros_like(phi)
+        rwsum = torch.zeros(B, 1, H, W, device=field.device)
+
+        for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
+            diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
+            sim = torch.exp(-diff / tau)
+
+            attract += nb * sim
+            awsum += sim
+
+            if use_repulsion:
+                push = (phi - nb) * (1.0 - sim)
+                repel += push
+                rwsum += (1.0 - sim)
+
+        phi_attract = attract / (awsum + 1e-8)
+        if use_repulsion:
+            phi_repel = phi + repel / (rwsum + 1e-8)
+            phi_new = phi_attract * (1 - repulsion_strength) + phi_repel * repulsion_strength
+        else:
+            phi_new = phi_attract
+
+        # ---- 多尺度 ----
+        if use_multiscale:
+            coarse = torch.nn.functional.interpolate(phi, scale_factor=0.5,
+                                                      mode='bilinear')
+            coarse, _ = primal_relax(coarse, tau=tau * 2.0, alpha=alpha * 0.3,
+                                      n_iters=1)
+            coarse_up = torch.nn.functional.interpolate(coarse, size=(H, W),
+                                                         mode='bilinear')
+            phi_new = phi_new * (1 - coarse_weight) + coarse_up * coarse_weight
+
+        # ---- 惯性 ----
+        if use_inertia:
+            change = (phi_new - phi).abs().mean(dim=1, keepdim=True)
+            history = history * inertia_decay + change * (1 - inertia_decay)
+            adaptive_alpha = alpha * (0.3 + 0.7 / (1.0 + history * 100))
+        else:
+            adaptive_alpha = alpha
 
         phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
 
