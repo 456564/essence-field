@@ -67,8 +67,15 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
     tau_map = diffs_stack.median(dim=0)[0].clamp(min=1e-6)      # tau: 中位数距离
     grad_map = diffs_stack.mean(dim=0)                            # 局部梯度 = 平均距离
 
-    for _ in range(n_iters):
+    # 每像素收敛掩码 — 已稳定的像素冻结
+    frozen = torch.zeros(B, 1, H, W, device=field.device, dtype=torch.bool)
+
+    for it in range(n_iters):
         prev = phi.clone()
+
+        # 只对未冻结的像素计算
+        active_mask = ~frozen  # [B, 1, H, W]
+        active_mask_float = active_mask.float()
 
         attract = torch.zeros_like(phi)
         awsum = torch.zeros(B, 1, H, W, device=field.device)
@@ -79,13 +86,10 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
         for i, (dy, dx) in enumerate([(0, 1), (0, -1), (1, 0), (-1, 0)]):
             nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
             diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
-            # 每像素自己的 tau —— 零全局常数
             sim = torch.exp(-diff / tau_map)
 
             attract += nb * sim
             awsum += sim
-
-            # 记录每个方向的相似度（用于自适应排斥）
             all_sim[:, i] = sim[:, 0]
 
             if repulsion:
@@ -96,17 +100,14 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
         phi_attract = attract / (awsum + 1e-8)
 
         if repulsion:
-            # 每像素自己的耦合强度 = 自身局部梯度
-            # 高梯度 → 需要强排斥（边缘/纹理）。低梯度 → 弱排斥（平坦区）
             consensus = all_sim.mean(dim=1, keepdim=True)
-            coupling = grad_map * 0.5  # 自身梯度 → 排斥力尺度
+            coupling = grad_map * 0.5
             adaptive_rep = (1.0 - consensus) * coupling
             phi_repel = phi + repel / (rwsum + 1e-8)
             phi_new = phi_attract * (1 - adaptive_rep) + phi_repel * adaptive_rep
         else:
             phi_new = phi_attract
 
-        # 惯性: 稳定越久 → 步长越小
         if inertia:
             change = (phi_new - phi).abs().mean(dim=1, keepdim=True)
             is_stable = change < 0.001
@@ -116,11 +117,19 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
         else:
             adaptive_alpha = alpha
 
+        # 更新（alpha 按活跃像素缩放）
         phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
 
-        d = (phi - prev).norm() / (phi.norm() + 1e-8)
-        conv.append(d.item())
-        if d < 1e-4:
+        # 检查收敛: 每像素自身变化 < 阈值 → 冻结
+        pixel_change = (phi - prev).abs().mean(dim=1, keepdim=True)
+        newly_frozen = (pixel_change < 1e-4) & ~frozen
+        frozen = frozen | newly_frozen
+
+        d = pixel_change.mean().item()
+        conv.append(d)
+
+        # 全部冻结 → 停止
+        if frozen.all():
             break
 
     return phi, conv
