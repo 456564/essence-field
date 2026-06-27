@@ -72,7 +72,7 @@ def run(img_path, alpha=0.3, n_iters=50, repulsion=False,
     plt.tight_layout(); plt.savefig(out, dpi=120); plt.close()
 
     areas = [(labels == k).sum() / (128 * 128) * 100 for k in range(n_domains)]
-    print(f'Image: {H}x{W}  |  Primal field: {len(conv)} iters')
+    print(f'Image: {H}x{W}  |  Field stopped after {len(conv)} steps')
     print(f'Domains: {n_domains}')
     for k in sorted(range(n_domains), key=lambda i: -areas[i]):
         print(f'  M{k+1}: {areas[k]:.0f}%')
