@@ -442,21 +442,28 @@ def field_to_materials(field_8, edge_metric=None, n_clusters=None):
     grad_x = np.abs(np.diff(field_np, axis=2, append=field_np[:, :, -1:]))
     field_grad = np.sqrt(np.mean(grad_y**2 + grad_x**2, axis=0))  # [H, W]
 
-    # ---- Step 2: 找盆地中心——场梯度极小 + 远离边缘 ----
+    # ---- Step 2: 自适应参数——复杂场景多峰，简单场景少峰 ----
     from scipy import ndimage
     from skimage.feature import peak_local_max
 
-    # 盆地高程 = 场梯度 + 边缘度规
-    elevation = field_grad + edge_np * 1.5
-    elevation = ndimage.gaussian_filter(elevation, sigma=7.0)
+    # 场梯度变异系数 → 图像复杂度
+    grad_cv = field_grad.std() / (field_grad.mean() + 1e-8)
+    # 自适应参数
+    if grad_cv > 1.5:       # 复杂（杂物桌面）
+        sigma_smooth = 5.0; min_dist = 20; num_peaks = 8
+    elif grad_cv > 0.8:     # 中等
+        sigma_smooth = 7.0; min_dist = 30; num_peaks = 6
+    elif grad_cv > 0.5:     # 简单（单物体+背景）
+        sigma_smooth = 5.0; min_dist = 18; num_peaks = 3
+    else:                    # 极简（均匀背景+小物体）
+        sigma_smooth = 3.0; min_dist = 15; num_peaks = 3
 
-    # 找局部极小值 = 物质中心
+    elevation = field_grad + edge_np * 1.5
+    elevation = ndimage.gaussian_filter(elevation, sigma=sigma_smooth)
     minima = peak_local_max(
-        -elevation,  # 反转 → 盆地底 = 峰
-        min_distance=30,
-        threshold_abs=-np.percentile(elevation, 40),
-        exclude_border=True,
-        num_peaks=6)
+        -elevation, min_distance=min_dist,
+        threshold_abs=-np.percentile(elevation, 40), exclude_border=True,
+        num_peaks=num_peaks)
 
     if len(minima) <= 1:
         # 找不到足够盆地 → 回退到单个物质
