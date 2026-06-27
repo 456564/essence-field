@@ -1,205 +1,84 @@
 """
-Primal Field v0 — 最小基元，单一规则
+Primal Field v1 — minimum primal, single rule, multi-faceted primal vector
 
-设计哲学：
-  像素的本性 = 相邻像素互相影响，影响强度 = 它们的相似度
-  不定义算子。不定义K。不定义边界。
-
-  相似 → 吸引 → 靠拢
-  相异 → 不吸引 → 自然分界
-
-  演化后: 向量一致的连通区域 = 物质
+Philosophy:
+  pixel's nature = neighbors influence each other, strength = similarity
+  primal vector = RGB(color face) + neighbor diffs(structure face) + local var(texture face)
+                = multi-faceted — same pixel expresses on multiple faces simultaneously
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 
 
-def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50,
-                 repulsion=0.0):
+def enrich_field(rgb_field):
     """
-    场弛豫——吸引+排斥。
+    RGB(3) -> RGB + structure = 8-dim primal vector.
 
-    规则: 相似→吸引(拉近)。不相似→排斥(推开)。
+    ch0-2: R,G,B (color face)
+    ch3-6: up/down/left/right neighbor diff (structure face)
+    ch7:   5x5 local variance (texture face)
 
-    Args:
-        field: [B, C, H, W] 初始场向量
-        tau: 温度。越小→只吸引极相似邻居
-        alpha: 步长
-        n_iters: 最大迭代数
-        repulsion: 排斥强度 [0, 1)。0=无排斥, 越大越排斥不相似邻居
-
-    Returns:
-        field_relaxed, convergence
+    Structure not named — naming is human's job after emergence.
     """
+    B, C, H, W = rgb_field.shape
+    device = rgb_field.device
+
+    # Color face
+    rgb = rgb_field
+
+    # Structure face: 4-direction neighbor diffs
+    diffs = []
+    for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+        nb = torch.roll(rgb_field, shifts=(dy, dx), dims=(2, 3))
+        diff = (rgb_field - nb).abs().mean(dim=1, keepdim=True)
+        diffs.append(diff)
+    structure = torch.cat(diffs, dim=1)  # [B, 4, H, W]
+
+    # Texture face: 5x5 local variance (avg over RGB channels)
+    kernel = torch.ones(1, 1, 5, 5, device=device) / 25
+    gray = rgb.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+    local_mean = F.conv2d(gray, kernel, padding=2)
+    local_sq_mean = F.conv2d(gray * gray, kernel, padding=2)
+    local_var = (local_sq_mean - local_mean * local_mean).clamp(min=0)
+
+    # Concat: color(3) + structure(4) + texture(1) = 8-dim
+    return torch.cat([rgb, structure, local_var], dim=1)
+
+
+def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
+    """Pure attraction (+ optional repulsion). Rule 1+2."""
     B, C, H, W = field.shape
     phi = field.clone()
     conv = []
 
     for _ in range(n_iters):
         prev = phi.clone()
-
-        # ---- 吸引: 相似邻居拉向我 ----
         attract = torch.zeros_like(phi)
         awsum = torch.zeros(B, 1, H, W, device=field.device)
-
-        # ---- 排斥: 不相似邻居推开我 ----
         repel = torch.zeros_like(phi)
         rwsum = torch.zeros(B, 1, H, W, device=field.device)
 
         for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
             nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
             diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
-            sim = torch.exp(-diff / tau)  # [0, 1]
-
-            # 吸引: 相似度 × 邻居向量
+            sim = torch.exp(-diff / tau)
             attract += nb * sim
             awsum += sim
-
-            # 排斥: 反向力 = 不相似度 × (我 - 邻居)方向
-            #        不相似 → 邻居和我差异大 → 推我远离它
             if repulsion > 0:
-                dissimilarity = 1.0 - sim  # [0, 1]
-                push = (phi - nb) * dissimilarity  # 推开方向
+                push = (phi - nb) * (1.0 - sim)
                 repel += push
-                rwsum += dissimilarity
+                rwsum += (1.0 - sim)
 
-        # 吸引: 加权平均
         phi_attract = attract / (awsum + 1e-8)
+        if repulsion > 0:
+            phi_repel = phi + repel / (rwsum + 1e-8)
+            phi_new = phi_attract * (1 - repulsion) + phi_repel * repulsion
+        else:
+            phi_new = phi_attract
 
-        # 排斥: 远离不相似邻居
-        phi_repel = phi + repel / (rwsum + 1e-8) if repulsion > 0 else phi
-
-        # 合力
-        phi_new = phi_attract * (1 - repulsion) + phi_repel * repulsion
         phi = (1 - alpha) * phi + alpha * phi_new
-
-        d = (phi - prev).norm() / (phi.norm() + 1e-8)
-        conv.append(d.item())
-        if d < 1e-4:
-            break
-
-    return phi, conv
-
-
-def primal_relax_repulsion(field, tau=0.05, alpha=0.3, n_iters=50):
-    """
-    纯排斥——不相似邻居推动像素远离。
-
-    规则: 不相似 → 推开。相似 → 不影响。
-    和吸引相反：吸引是靠拢，排斥是推开。
-    """
-    B, C, H, W = field.shape
-    phi = field.clone()
-    conv = []
-
-    for _ in range(n_iters):
-        prev = phi.clone()
-        repel = torch.zeros_like(phi)
-        rwsum = torch.zeros(B, 1, H, W, device=field.device)
-
-        for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-            nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
-            diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
-            sim = torch.exp(-diff / tau)
-            # 不相似度 = 推开权重
-            push = (phi - nb) * (1.0 - sim)
-            repel += push
-            rwsum += (1.0 - sim)
-
-        phi_new = phi + repel / (rwsum + 1e-8)
-        phi = (1 - alpha) * phi + alpha * phi_new
-
-        d = (phi - prev).norm() / (phi.norm() + 1e-8)
-        conv.append(d.item())
-        if d < 1e-4:
-            break
-
-    return phi, conv
-
-
-def primal_relax_multiscale(field, tau=0.05, alpha=0.3, n_iters=50,
-                             repulsion=0.0, scales=2):
-    """
-    多尺度弛豫。规则3：不同空间频率用不同速率演化。
-
-    纹理(高频) → 原图尺度交互（快速）
-    轮廓(低频) → 降采样后交互 → 上采样回原图（慢速）
-
-    效果: 纹理不碎——因为粗尺度看不到纹理缝隙。
-          轮廓保持——因为粗尺度能跨越纹理的干扰看到大轮廓。
-    """
-    if scales <= 1:
-        return primal_relax(field, tau, alpha, n_iters, repulsion)
-
-    B, C, H, W = field.shape
-    phi = field.clone()
-
-    for _ in range(n_iters):
-        # 细尺度: 原图上的吸引+排斥（处理纹理）
-        phi, _conv = primal_relax(phi, tau=tau * 0.5, alpha=alpha * 0.5,
-                                   n_iters=1, repulsion=repulsion * 0.3)
-
-        # 粗尺度: 降采样 → 弛豫 → 上采样
-        coarse = torch.nn.functional.interpolate(phi, scale_factor=0.5,
-                                                  mode='bilinear')
-        coarse, _ = primal_relax(coarse, tau=tau * 2.0, alpha=alpha * 0.3,
-                                  n_iters=1, repulsion=repulsion * 0.7)
-        coarse_up = torch.nn.functional.interpolate(coarse, size=(H, W),
-                                                     mode='bilinear')
-
-        # 融合: 细尺度主导纹理，粗尺度引导轮廓
-        phi = phi * 0.7 + coarse_up * 0.3
-
-    return phi, [0.0]  # conv trivial for multi-scale wrapper
-
-
-def primal_relax_inertia(field, tau=0.05, alpha=0.3, n_iters=50,
-                         inertia_gain=0.3):
-    """
-    惯性弛豫。规则4：先稳定的区域抵抗后续变化。
-
-    物理定义: 越久没变的像素越难被扰动（=质量）。
-    不是"过去变化大不大"——是"多久没变了"。
-
-    实现: 连续稳定轮数计数器。变一次就清零。
-         稳定越久 → adaptive_alpha 越小 → 近乎冻结。
-    """
-    B, C, H, W = field.shape
-    phi = field.clone()
-    conv = []
-
-    # 连续稳定计数器（非 EMA）
-    stability = torch.zeros(B, 1, H, W, device=field.device)
-
-    for _ in range(n_iters):
-        prev = phi.clone()
-
-        attract = torch.zeros_like(phi)
-        awsum = torch.zeros(B, 1, H, W, device=field.device)
-
-        for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-            nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
-            diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
-            sim = torch.exp(-diff / tau)
-            attract += nb * sim
-            awsum += sim
-
-        phi_new = attract / (awsum + 1e-8)
-
-        # 每像素变化量
-        change = (phi_new - phi).abs().mean(dim=1, keepdim=True)
-
-        # 稳定计数器: 变化<阈值 → +1, 否则清零
-        is_stable = change < 0.001
-        stability = torch.where(is_stable, stability + 1,
-                                torch.zeros_like(stability))
-
-        # 自适应步长: 稳定越久 → alpha 越小
-        adaptive_alpha = alpha / (1.0 + stability * inertia_gain)
-
-        phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
-
         d = (phi - prev).norm() / (phi.norm() + 1e-8)
         conv.append(d.item())
         if d < 1e-4:
@@ -211,18 +90,8 @@ def primal_relax_inertia(field, tau=0.05, alpha=0.3, n_iters=50,
 def primal_relax_full(field, tau=0.05, alpha=0.3, n_iters=50,
                        use_repulsion=False, repulsion_strength=0.1,
                        use_multiscale=False, coarse_weight=0.15,
-                       use_inertia=False, inertia_decay=0.9):
-    """
-    任意组合的场弛豫——四条规则自由开关。
-
-    Args:
-        use_repulsion: 启用排斥
-        repulsion_strength: 排斥力权重 [0,1)
-        use_multiscale: 启用多尺度
-        coarse_weight: 粗尺度融合权重
-        use_inertia: 启用惯性
-        inertia_decay: 历史衰减率
-    """
+                       use_inertia=False, inertia_gain=0.3):
+    """All 4 rules switchable. Rule 1+2+3+4."""
     if not use_repulsion and not use_multiscale and not use_inertia:
         return primal_relax(field, tau, alpha, n_iters)
 
@@ -234,7 +103,7 @@ def primal_relax_full(field, tau=0.05, alpha=0.3, n_iters=50,
     for it in range(n_iters):
         prev = phi.clone()
 
-        # ---- 吸引 + 排斥 ----
+        # Attraction + Repulsion
         attract = torch.zeros_like(phi)
         awsum = torch.zeros(B, 1, H, W, device=field.device)
         repel = torch.zeros_like(phi)
@@ -244,10 +113,8 @@ def primal_relax_full(field, tau=0.05, alpha=0.3, n_iters=50,
             nb = torch.roll(phi, shifts=(dy, dx), dims=(2, 3))
             diff = (nb - phi).pow(2).sum(dim=1, keepdim=True)
             sim = torch.exp(-diff / tau)
-
             attract += nb * sim
             awsum += sim
-
             if use_repulsion:
                 push = (phi - nb) * (1.0 - sim)
                 repel += push
@@ -260,28 +127,23 @@ def primal_relax_full(field, tau=0.05, alpha=0.3, n_iters=50,
         else:
             phi_new = phi_attract
 
-        # ---- 多尺度 ----
+        # Multi-scale
         if use_multiscale:
-            coarse = torch.nn.functional.interpolate(phi, scale_factor=0.5,
-                                                      mode='bilinear')
-            coarse, _ = primal_relax(coarse, tau=tau * 2.0, alpha=alpha * 0.3,
-                                      n_iters=1)
-            coarse_up = torch.nn.functional.interpolate(coarse, size=(H, W),
-                                                         mode='bilinear')
+            coarse = F.interpolate(phi, scale_factor=0.5, mode='bilinear')
+            coarse, _ = primal_relax(coarse, tau=tau * 2.0, alpha=alpha * 0.3, n_iters=1)
+            coarse_up = F.interpolate(coarse, size=(H, W), mode='bilinear')
             phi_new = phi_new * (1 - coarse_weight) + coarse_up * coarse_weight
 
-        # ---- 惯性（连续稳定计数，非 EMA） ----
+        # Inertia (consecutive stability counter)
         if use_inertia:
             change = (phi_new - phi).abs().mean(dim=1, keepdim=True)
             is_stable = change < 0.001
-            stability = torch.where(is_stable, stability + 1,
-                                    torch.zeros_like(stability))
-            adaptive_alpha = alpha / (1.0 + stability * 0.3)
+            stability = torch.where(is_stable, stability + 1, torch.zeros_like(stability))
+            adaptive_alpha = alpha / (1.0 + stability * inertia_gain)
         else:
             adaptive_alpha = alpha
 
         phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
-
         d = (phi - prev).norm() / (phi.norm() + 1e-8)
         conv.append(d.item())
         if d < 1e-4:
@@ -291,42 +153,22 @@ def primal_relax_full(field, tau=0.05, alpha=0.3, n_iters=50,
 
 
 def extract_domains(field_relaxed, grad_pct=75, min_domain_size=None):
-    """
-    从弛豫场中提取物质域。
-
-    场梯度低 = 邻域一致 = 物质内部。连通分量 = 物质域。
-
-    Args:
-        field_relaxed: [B, C, H, W]
-        grad_pct: 梯度阈值百分位
-        min_domain_size: 最小域大小（像素数），None=1%面积
-
-    Returns:
-        labels: [H, W] 物质标签
-        n_domains: int
-    """
+    """Extract material domains from relaxed field via field gradient."""
     B, C, H, W = field_relaxed.shape
     field_np = field_relaxed[0].detach().cpu().numpy()
 
-    # 场梯度
     gy = np.abs(np.diff(field_np, axis=1, append=field_np[:, -1:, :])).mean(0)
     gx = np.abs(np.diff(field_np, axis=2, append=field_np[:, :, -1:])).mean(0)
     grad = gy + gx
-
-    # 梯度低 = 物质内部
     interior = grad < np.percentile(grad, grad_pct)
 
     from scipy import ndimage
     labels, n_raw = ndimage.label(interior)
 
-    # 最小尺寸过滤
     if min_domain_size is None:
-        min_domain_size = H * W // 100
-    if min_domain_size < 50:
-        min_domain_size = 50
+        min_domain_size = max(50, H * W // 100)
 
-    sizes = ndimage.sum(np.ones_like(labels), labels,
-                        index=range(1, n_raw + 1))
+    sizes = ndimage.sum(np.ones_like(labels), labels, index=range(1, n_raw + 1))
     new_labels = np.zeros_like(labels)
     next_id = 1
     for lid in range(1, n_raw + 1):
@@ -337,5 +179,4 @@ def extract_domains(field_relaxed, grad_pct=75, min_domain_size=None):
     labels = new_labels - 1
     labels = labels.clip(min=0)
     n_domains = labels.max() + 1 if labels.max() >= 0 else 0
-
     return labels, n_domains

@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-from src.primal import primal_relax, primal_relax_full, extract_domains
+from src.primal import primal_relax, primal_relax_full, extract_domains, enrich_field
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -37,22 +37,22 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, flags=8):
     img_small = cv2.resize(img_rgb, (128, 128))
     x = torch.from_numpy(img_small).permute(2, 0, 1).float().unsqueeze(0).to(DEVICE) / 255.
 
-    # 解析组合: flags ∈ [0,15], bit3=吸引, bit2=排斥, bit1=多尺度, bit0=惯性
+    # 丰富基元向量: RGB(3) → RGB+结构+纹理(8)
+    x_enriched = enrich_field(x)
+
+    # 解析组合
     use_att, use_rep, use_ms, use_inert = parse_flags(flags)
 
     if not use_att and not use_rep and not use_ms and not use_inert:
-        # 全关 → 返回原图，1域
-        field = x; conv = [0.0]; labels = np.zeros((128,128), dtype=int); n_domains = 1
+        field = x_enriched; conv = [0.0]; labels = np.zeros((128,128), dtype=int); n_domains = 1
     elif not use_att:
-        # 纯排斥/多尺度/惯性 → 用对应单规则
-        field, conv = primal_relax(x, tau=tau, alpha=alpha, n_iters=n_iters)
+        field, conv = primal_relax(x_enriched, tau=tau, alpha=alpha, n_iters=n_iters)
     else:
-        # 吸引开启 → 用组合函数
         field, conv = primal_relax_full(
-            x, tau=tau, alpha=alpha, n_iters=n_iters,
+            x_enriched, tau=tau, alpha=alpha, n_iters=n_iters,
             use_repulsion=use_rep, repulsion_strength=0.1,
             use_multiscale=use_ms, coarse_weight=0.15,
-            use_inertia=use_inert, inertia_decay=0.9)
+            use_inertia=use_inert, inertia_gain=0.3)
     labels, n_domains = extract_domains(field)
 
     # 多色分割
@@ -69,12 +69,13 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, flags=8):
     gx = np.abs(np.diff(phi_np, axis=2, append=phi_np[:, :, -1:])).mean(0)
     grad = gy + gx
 
-    # 弛豫后图像
-    phi_rgb = np.clip(field[0].permute(1, 2, 0).cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    # 弛豫后图像（取前3通道 RGB 面显示）
+    phi_vis = field[0, :3].permute(1, 2, 0).cpu().numpy()
+    phi_vis = np.clip((phi_vis - phi_vis.min()) / (phi_vis.max() - phi_vis.min() + 1e-8) * 255, 0, 255).astype(np.uint8)
 
     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     axes[0].imshow(img_small); axes[0].set_title('Original'); axes[0].axis('off')
-    axes[1].imshow(phi_rgb); axes[1].set_title(f'Primal Field\n({len(conv)} iters)'); axes[1].axis('off')
+    axes[1].imshow(phi_vis); axes[1].set_title(f'Primal Field\n({len(conv)} iters)'); axes[1].axis('off')
     axes[2].imshow(grad, cmap='hot'); axes[2].set_title('Field Gradient\n(= natural boundary)'); axes[2].axis('off')
     axes[3].imshow(overlay); axes[3].set_title(f'{n_domains} Domains'); axes[3].axis('off')
 
