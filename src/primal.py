@@ -57,14 +57,15 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
     conv = []
     stability = torch.zeros(B, 1, H, W, device=field.device) if inertia else None
 
-    # 每像素自己的 tau: 初始 4 邻域距离的中位数
+    # 每像素的自身性质（从初始场计算，不随演化改变）
     diffs_init = []
     for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
         nb = torch.roll(field, shifts=(dy, dx), dims=(2, 3))
         d = (nb - field).pow(2).sum(dim=1, keepdim=True)
         diffs_init.append(d)
-    tau_map = torch.stack(diffs_init).median(dim=0)[0]  # [B,1,H,W]
-    tau_map = tau_map.clamp(min=1e-6)
+    diffs_stack = torch.stack(diffs_init)  # [4, B, 1, H, W]
+    tau_map = diffs_stack.median(dim=0)[0].clamp(min=1e-6)      # tau: 中位数距离
+    grad_map = diffs_stack.mean(dim=0)                            # 局部梯度 = 平均距离
 
     for _ in range(n_iters):
         prev = phi.clone()
@@ -95,9 +96,10 @@ def primal_relax(field, alpha=0.3, n_iters=50, repulsion=0.0,
         phi_attract = attract / (awsum + 1e-8)
 
         if repulsion:
-            # 争议度 × 耦合常数(0.2) = 排斥力。常数=物理定律，非人为调参。
+            # 每像素自己的耦合强度 = 自身局部梯度
+            # 高梯度 → 需要强排斥（边缘/纹理）。低梯度 → 弱排斥（平坦区）
             consensus = all_sim.mean(dim=1, keepdim=True)
-            coupling = 0.2  # 排斥耦合常数——like fine-structure constant
+            coupling = grad_map * 0.5  # 自身梯度 → 排斥力尺度
             adaptive_rep = (1.0 - consensus) * coupling
             phi_repel = phi + repel / (rwsum + 1e-8)
             phi_new = phi_attract * (1 - adaptive_rep) + phi_repel * adaptive_rep
@@ -151,18 +153,9 @@ def primal_relax_multiscale(field, alpha=0.3, n_iters=50,
         coarse_up = torch.nn.functional.interpolate(
             coarse, size=(H, W), mode='bilinear')
 
-        # 自适应融合权重: 局部碎片化 = 邻域向量标准差
-        kernel = torch.ones(1, 1, 5, 5, device=field.device) / 25
-        phi_mean = torch.nn.functional.conv2d(
-            phi.view(-1, 1, H, W), kernel, padding=2)
-        phi_sq_mean = torch.nn.functional.conv2d(
-            (phi * phi).view(-1, 1, H, W), kernel, padding=2)
-        local_var = (phi_sq_mean - phi_mean * phi_mean).clamp(min=0)
-        local_std = local_var.sqrt().reshape(B, C, H, W).mean(dim=1, keepdim=True)
-
-        # 碎片化 → 权重高
-        adaptive_weight = local_std * coarse_weight_max * 5.0
-        adaptive_weight = adaptive_weight.clamp(0, coarse_weight_max)
+        # 融合权重 = 粗细尺度差异。差异大 → 粗尺度有结构信息
+        scale_diff = (phi - coarse_up).abs().mean(dim=1, keepdim=True)
+        adaptive_weight = scale_diff.clamp(0, 0.3)
 
         phi = phi * (1 - adaptive_weight) + coarse_up * adaptive_weight
 
