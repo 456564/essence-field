@@ -97,7 +97,7 @@ if __name__ == '__main__':
     parser.add_argument('image', help='图片路径')
     parser.add_argument('--tau', type=float, default=0.02, help='温度(越小越挑剔)')
     parser.add_argument('--alpha', type=float, default=0.3, help='步长')
-    parser.add_argument('--iters', type=int, default=500, help='最大迭代数(仅安全上限，收敛自动停)')
+    parser.add_argument('--iters', type=int, default=50, help='最大迭代数(仅安全上限，收敛自动停)')
     parser.add_argument('--repulsion', type=float, default=0.0, help='(legacy)')
     parser.add_argument('--rule', type=int, default=0, help='(legacy)')
     parser.add_argument('--flags', type=int, default=8, help='规则组合 0-15 (8=仅吸引)')
