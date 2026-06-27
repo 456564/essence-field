@@ -15,18 +15,17 @@ import torch
 import numpy as np
 
 
-def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
+def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0,
+                 inertia=False):
     """
-    场弛豫。规则：吸引 + 自适应排斥。
+    场弛豫。规则：吸引 + 自适应排斥 + 惯性。
 
-    自适应: 每个像素自己算邻域争议度。
-           争议大→强排斥(边界/缝隙)，争议小→弱排斥(平坦区)。
-
-    repulsion 参数是排斥力物理上限，非全局强度。
+    惯性: 连续稳定计数。稳定越久 → 步长越小 → 抗拒扰动。
     """
     B, C, H, W = field.shape
     phi = field.clone()
     conv = []
+    stability = torch.zeros(B, 1, H, W, device=field.device) if inertia else None
 
     for _ in range(n_iters):
         prev = phi.clone()
@@ -65,7 +64,17 @@ def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0):
         else:
             phi_new = phi_attract
 
-        phi = (1 - alpha) * phi + alpha * phi_new
+        # 惯性: 稳定越久 → 步长越小
+        if inertia:
+            change = (phi_new - phi).abs().mean(dim=1, keepdim=True)
+            is_stable = change < 0.001
+            stability = torch.where(is_stable, stability + 1,
+                                    torch.zeros_like(stability))
+            adaptive_alpha = alpha / (1.0 + stability * 0.3)
+        else:
+            adaptive_alpha = alpha
+
+        phi = (1 - adaptive_alpha) * phi + adaptive_alpha * phi_new
 
         d = (phi - prev).norm() / (phi.norm() + 1e-8)
         conv.append(d.item())

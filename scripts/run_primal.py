@@ -20,7 +20,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0,
-        multiscale=False):
+        multiscale=False, inertia=False):
     img = cv2.imread(img_path)
     if img is None:
         print(f'Cannot read: {img_path}')
@@ -36,7 +36,7 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0,
             x, tau=tau, alpha=alpha, n_iters=n_iters, repulsion=repulsion)
     else:
         field, conv = primal_relax(x, tau=tau, alpha=alpha, n_iters=n_iters,
-                                   repulsion=repulsion)
+                                   repulsion=repulsion, inertia=inertia)
     labels, n_domains = extract_domains(field)
 
     # 多色分割
@@ -83,6 +83,7 @@ if __name__ == '__main__':
     parser.add_argument('--iters', type=int, default=50, help='最大迭代数')
     parser.add_argument('--repulsion', type=float, default=0.0, help='排斥强度 [0,1)')
     parser.add_argument('--multiscale', action='store_true', help='启用多尺度')
+    parser.add_argument('--inertia', action='store_true', help='启用惯性')
     args = parser.parse_args()
     run(args.image, args.tau, args.alpha, args.iters, args.repulsion,
-        args.multiscale)
+        args.multiscale, args.inertia)
