@@ -15,6 +15,38 @@ import torch
 import numpy as np
 
 
+def enrich_field(rgb_field):
+    """
+    RGB(3) → RGB + 结构关系(8维)。
+
+    4方向邻域差异: 每个方向 = RGB 三通道差的绝对值均值。
+    R_diff≈G_diff≈B_diff → 3→1 压缩。
+    局部方差: 5x5 窗口。
+
+    人不选择维度。信息源完备。
+    """
+    B, C, H, W = rgb_field.shape
+    device = rgb_field.device
+
+    parts = [rgb_field]
+
+    # 4方向结构关系
+    for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+        nb = torch.roll(rgb_field, shifts=(dy, dx), dims=(2, 3))
+        diff = (rgb_field - nb).abs().mean(dim=1, keepdim=True)
+        parts.append(diff)
+
+    # 局部方差
+    kernel = torch.ones(1, 1, 5, 5, device=device) / 25
+    gray = rgb_field.mean(dim=1, keepdim=True)
+    local_mean = torch.nn.functional.conv2d(gray, kernel, padding=2)
+    local_sq_mean = torch.nn.functional.conv2d(gray * gray, kernel, padding=2)
+    local_var = (local_sq_mean - local_mean * local_mean).clamp(min=0)
+    parts.append(local_var)
+
+    return torch.cat(parts, dim=1)
+
+
 def primal_relax(field, tau=0.05, alpha=0.3, n_iters=50, repulsion=0.0,
                  inertia=False):
     """

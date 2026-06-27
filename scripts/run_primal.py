@@ -14,13 +14,14 @@ import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-from src.primal import primal_relax, primal_relax_multiscale, extract_domains
+from src.primal import (primal_relax, primal_relax_multiscale,
+                       extract_domains, enrich_field)
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0,
-        multiscale=False, inertia=False):
+        multiscale=False, inertia=False, enrich=False):
     img = cv2.imread(img_path)
     if img is None:
         print(f'Cannot read: {img_path}')
@@ -28,7 +29,10 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0,
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     H, W = img_rgb.shape[:2]
     img_small = cv2.resize(img_rgb, (128, 128))
-    x = torch.from_numpy(img_small).permute(2, 0, 1).float().unsqueeze(0).to(DEVICE) / 255.
+    x_rgb = torch.from_numpy(img_small).permute(2, 0, 1).float().unsqueeze(0).to(DEVICE) / 255.
+
+    # 基元向量
+    x = enrich_field(x_rgb) if enrich else x_rgb
 
     # 场弛豫
     if multiscale:
@@ -53,12 +57,13 @@ def run(img_path, tau=0.02, alpha=0.3, n_iters=50, repulsion=0.0,
     gx = np.abs(np.diff(phi_np, axis=2, append=phi_np[:, :, -1:])).mean(0)
     grad = gy + gx
 
-    # 弛豫后图像
-    phi_rgb = np.clip(field[0].permute(1, 2, 0).cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    # 弛豫后图像（取前3通道 = RGB面）
+    phi_vis = field[0, :3].permute(1, 2, 0).cpu().numpy()
+    phi_vis = np.clip((phi_vis - phi_vis.min()) / (phi_vis.max() - phi_vis.min() + 1e-8) * 255, 0, 255).astype(np.uint8)
 
     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     axes[0].imshow(img_small); axes[0].set_title('Original'); axes[0].axis('off')
-    axes[1].imshow(phi_rgb); axes[1].set_title(f'Primal Field\n({len(conv)} iters)'); axes[1].axis('off')
+    axes[1].imshow(phi_vis); axes[1].set_title(f'Primal Field\n({len(conv)} iters)'); axes[1].axis('off')
     axes[2].imshow(grad, cmap='hot'); axes[2].set_title('Field Gradient\n(= natural boundary)'); axes[2].axis('off')
     axes[3].imshow(overlay); axes[3].set_title(f'{n_domains} Domains'); axes[3].axis('off')
 
@@ -84,6 +89,7 @@ if __name__ == '__main__':
     parser.add_argument('--repulsion', type=float, default=0.0, help='排斥强度 [0,1)')
     parser.add_argument('--multiscale', action='store_true', help='启用多尺度')
     parser.add_argument('--inertia', action='store_true', help='启用惯性')
+    parser.add_argument('--enrich', action='store_true', help='丰富基元向量(RGB→8维)')
     args = parser.parse_args()
     run(args.image, args.tau, args.alpha, args.iters, args.repulsion,
-        args.multiscale, args.inertia)
+        args.multiscale, args.inertia, args.enrich)
